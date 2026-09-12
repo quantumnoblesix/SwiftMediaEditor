@@ -6,35 +6,88 @@ All notable changes to this package are documented here. The format follows
 
 ## [Unreleased]
 
-The first public release, to be tagged `0.1.0`.
+## [1.0.0] - 2026-09-12
+
+The first public release.
 
 ### Added
 
+#### Editor
+
 - A turnkey photo and video editor for UIKit (`MediaEditorViewController`) and
   SwiftUI (`MediaEditorView`), on iOS 17 and Mac Catalyst 17.
-- `MediaEditorCore`, the headless half: the non-destructive `EditRecipe` model,
-  `EditHistory` undo/redo, `PhotoRenderer`, and `VideoComposer`. It also builds
-  natively on macOS 14.
-- Crop with aspect presets, including the source's own ratio; free rotation with
-  a straighten dial and 90° steps; horizontal and vertical flip — for photos and
-  videos.
-- Color filters for photos.
-- PencilKit drawing and text, emoji and image stickers on photos and videos,
-  burned into the output. Drag a sticker onto the bin to delete it.
-- Video trimming on a filmstrip, a tap-to-play/pause preview, an elapsed/total
-  time readout, and audio track removal.
-- Video export with progress and cancellation, in HEVC or H.264, with an
-  optional cap on output resolution.
 - Undo/redo, and re-opening an edit from a saved recipe.
 - Separate tool sets for photos and videos
   (`EditorConfiguration.photoTools` / `videoTools`).
-- Styling through `EditorAppearance` — Liquid Glass on iOS 26, with a fallback on
-  earlier versions — and fully custom tool rows through
-  `MediaEditorToolbarProviding`.
+
+#### Crop, rotation, and filters
+
+- Crop with aspect presets — Original, Free, 1:1, 4:3, 16:9, and 9:16 by
+  default, configurable through `EditorConfiguration.aspectPresets` — and a
+  reset button.
+- Free rotation with a straighten dial and 90° steps, plus horizontal and
+  vertical flip, for photos and videos.
+- Color filters for photos: Vivid, Mono, Noir, Fade, Chrome, Sepia, and Invert.
+- Photos keep their EXIF orientation, and videos the orientation they were
+  recorded in.
+
+#### Drawing, text, and stickers
+
+- PencilKit drawing and text, emoji, and image stickers on photos and videos,
+  burned into the output.
+- Stickers move with a drag, resize with a pinch, and rotate with two fingers —
+  or resize and rotate with one finger using the corner handle. Double-tapping a
+  text sticker edits it again.
+- Text in six preset colors, or any color from the system color picker,
+  including opacity.
+- Image stickers from the system photo picker, which needs no photo library
+  permission. The image is stored in the recipe, so a reopened edit keeps it.
+- Drag a sticker onto the bin to delete it, with a haptic tap when it's over the
+  bin.
+
+#### Video
+
+- Trimming on a filmstrip, a tap-to-play/pause preview, and an elapsed/total
+  time readout.
+- Audio track removal, offered only for videos that have audio.
+- Export with a progress panel and cancellation, in HEVC, H.264, or any
+  `AVAssetExportSession` preset, with an optional cap on output resolution. A
+  failed export shows an alert and keeps the editor open.
+
+#### Customization
+
+- Styling through `EditorAppearance`: accent, tint, and delete colors, trimmer
+  colors, replacement SF Symbols for any action, and per-button styling hooks.
+  The chrome uses Liquid Glass on iOS 26, falls back to a blurred material on
+  earlier versions, and can opt out of glass everywhere.
+- Fully custom tool rows through `MediaEditorToolbarProviding`.
+- Control from code: `perform(_:)`, `apply(_:)`, `isEnabled(_:)`, `isActive(_:)`,
+  and the calls that open the crop, drawing, and filter tools.
+
+#### Headless API
+
+- `MediaEditorCore`: the non-destructive `EditRecipe` model, `EditHistory`
+  undo/redo, `PhotoRenderer`, and `VideoComposer`. It also builds natively on
+  macOS 14.
+- Drawing and stickers can be burned into a video export through
+  `VideoComposer`'s `overlayImage`, and rendered outside the editor with
+  `MediaEditorUIKit`'s `OverlayCompositor` and `DrawingCompositor`.
+- Recipes are `Codable`, and fields added later decode with defaults, so recipes
+  saved with this version keep loading in future ones.
+
+#### Accessibility and localization
+
+- VoiceOver labels on the tool buttons, a play/pause button and time readout set
+  up for VoiceOver, and a VoiceOver action to delete stickers.
 - UI localized in English, Italian, French, Spanish, and Brazilian Portuguese.
-- A VoiceOver action to delete stickers.
+  Apps can reword any string by defining the same key in their own
+  `Localizable.strings`.
+
+#### Distribution
+
 - Privacy manifests for the core and UI modules.
 - DocC documentation for each module.
+- An example app with standard, branded, and fully custom editors.
 
 ### Known limitations
 
@@ -42,3 +95,6 @@ The first public release, to be tagged `0.1.0`.
   HDR source comes out SDR.
 - On native macOS only `MediaEditorCore` is available; the editor UI runs on the
   Mac through Mac Catalyst.
+
+[Unreleased]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.0.0...HEAD
+[1.0.0]: https://github.com/quantumnoblesix/SwiftMediaEditor/releases/tag/1.0.0
