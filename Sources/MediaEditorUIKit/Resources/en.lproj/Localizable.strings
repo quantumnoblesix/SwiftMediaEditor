@@ -1,0 +1,65 @@
+/* Dismisses without saving */
+"action.cancel" = "Cancel";
+/* Confirms and saves */
+"action.done" = "Done";
+/* Applies the current tool's edit */
+"action.apply" = "Apply";
+/* Acknowledges an alert */
+"action.ok" = "OK";
+
+/* Title of the crop tool */
+"tool.crop.title" = "Crop";
+/* Title of the drawing tool */
+"tool.draw.title" = "Draw";
+
+/* Unconstrained crop aspect ratio */
+"crop.aspect.free" = "Free";
+/* The source's own aspect ratio */
+"crop.aspect.original" = "Original";
+
+/* Adds a text overlay */
+"overlay.add.text" = "Text";
+/* Adds an image overlay */
+"overlay.add.photo" = "Photo";
+
+/* Alert title when export fails */
+"export.failed.title" = "Export Failed";
+/* Export progress; %d is the percentage */
+"export.progress" = "Exporting… %d%%";
+
+/* Title of the filters tool */
+"tool.filters.title" = "Filters";
+/* Filter names */
+"filter.original" = "Original";
+"filter.vivid" = "Vivid";
+"filter.mono" = "Mono";
+"filter.noir" = "Noir";
+"filter.fade" = "Fade";
+"filter.chrome" = "Chrome";
+"filter.sepia" = "Sepia";
+"filter.invert" = "Invert";
+
+/* Video playback + audio */
+/* Starts video playback */
+"action.play" = "Play";
+/* Pauses video playback */
+"action.pause" = "Pause";
+/* Drops the video's audio track */
+"video.audio.remove" = "Remove Audio";
+/* Brings the video's audio track back */
+"video.audio.restore" = "Restore Audio";
+
+/* Toolbar actions */
+/* Reverts the last edit */
+"action.undo" = "Undo";
+/* Reapplies a reverted edit */
+"action.redo" = "Redo";
+/* Rotates 90 degrees clockwise */
+"tool.rotate" = "Rotate";
+/* Mirrors left-to-right */
+"tool.flip.horizontal" = "Flip Horizontal";
+/* Mirrors top-to-bottom */
+"tool.flip.vertical" = "Flip Vertical";
+
+/* Removes a sticker or text overlay; offered to VoiceOver as an action */
+"action.delete" = "Delete";
