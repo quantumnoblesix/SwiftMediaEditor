@@ -1,0 +1,23 @@
+.DS_Store
+/.build
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.netrc
+
+# Example app local state
+Examples/**/xcuserdata/
+Examples/**/.swiftpm/
+Examples/**/project.xcworkspace/xcshareddata/swiftpm/
+
+# AI coding assistant files stay local. The rules every contributor follows,
+# human or not, live in CONTRIBUTING.md.
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json
+
+# Local planning notes
+/PLAN.md
