@@ -41,6 +41,8 @@ final class TrimScrubberView: UIView {
     private(set) var duration: Double = 0
     private(set) var trimStart: Double = 0
     private(set) var trimEnd: Double = 0
+    /// Where the playhead was last put, in seconds — what VoiceOver steps from.
+    private(set) var playheadTime: Double = 0
 
     private let filmstrip = UIStackView()
     // The frame and its draggable edges. Internal so tests can check their styling.
@@ -82,6 +84,7 @@ final class TrimScrubberView: UIView {
         filmstrip.axis = .horizontal
         filmstrip.distribution = .fillEqually
         filmstrip.isUserInteractionEnabled = false
+        filmstrip.accessibilityIgnoresInvertColors = true   // frames of the video, not chrome
         addSubview(filmstrip)
 
         for dim in [dimLeft, dimRight] {
@@ -198,6 +201,7 @@ final class TrimScrubberView: UIView {
     /// the kept range its raw position falls under a handle, and since it's drawn
     /// above them it would paint a white stripe down the grip.
     func updatePlayhead(time: Double) {
+        playheadTime = time
         guard duration > 0, bounds.width > 0 else { return }
         playhead.isHidden = false
         let halfWidth: CGFloat = 1
@@ -278,6 +282,64 @@ final class TrimScrubberView: UIView {
         delegate?.trimScrubber(self, didChangeTrimFrom: trimStart, to: trimEnd, movingEdge: edge)
     }
 
+    // MARK: - Accessibility
+
+    /// A drag surface with three things on it, so VoiceOver gets three adjustable
+    /// elements: the in-point, the playhead, and the out-point.
+    private lazy var accessibilityParts: [TrimAccessibilityElement] = [
+        TrimAccessibilityElement(scrubber: self, part: .start),
+        TrimAccessibilityElement(scrubber: self, part: .position),
+        TrimAccessibilityElement(scrubber: self, part: .end),
+    ]
+
+    override var accessibilityElements: [Any]? {
+        get { duration > 0 ? accessibilityParts : [] }
+        set {}
+    }
+
+    /// One VoiceOver step, in seconds: a twentieth of the clip, and never less
+    /// than a tenth of a second.
+    var accessibilityStep: Double { max(0.1, duration / 20) }
+
+    /// Moves `part` one step later (`direction` 1) or earlier (-1), reported like
+    /// a finished drag.
+    func stepAccessibility(_ part: TrimAccessibilityElement.Part, direction: Double) {
+        let delta = direction * accessibilityStep
+        switch part {
+        case .start:
+            trimStart = min(max(0, trimStart + delta), trimEnd - minDuration)
+            notifyChange(.start)
+            delegate?.trimScrubberDidCommit(self)
+        case .end:
+            trimEnd = max(min(duration, trimEnd + delta), trimStart + minDuration)
+            notifyChange(.end)
+            delegate?.trimScrubberDidCommit(self)
+        case .position:
+            delegate?.trimScrubber(self, didScrubTo: min(max(playheadTime + delta, trimStart), trimEnd))
+        }
+        setNeedsLayout()
+    }
+
+    /// Where `part` is, the way VoiceOver should say it: "2.5 seconds".
+    func spokenValue(for part: TrimAccessibilityElement.Part) -> String {
+        let seconds: Double
+        switch part {
+        case .start:    seconds = trimStart
+        case .position: seconds = playheadTime
+        case .end:      seconds = trimEnd
+        }
+        return PlaybackTimeLabel.spokenTime(seconds, locale: .autoupdatingCurrent)
+    }
+
+    /// Where `part` sits in this view, widened to a 44-point target.
+    func elementFrame(for part: TrimAccessibilityElement.Part) -> CGRect {
+        switch part {
+        case .start:    return leftHandle.frame.insetBy(dx: -13, dy: 0)
+        case .end:      return rightHandle.frame.insetBy(dx: -13, dy: 0)
+        case .position: return playhead.isHidden ? bounds : playhead.frame.insetBy(dx: -21, dy: 0)
+        }
+    }
+
     // MARK: - Thumbnails
 
     /// Generates evenly spaced thumbnails off the main actor. The asset and
@@ -303,6 +365,48 @@ final class TrimScrubberView: UIView {
         }
         return images
     }
+}
+
+/// One of the trimmer's VoiceOver elements: its start handle, its playhead, or
+/// its end handle, each adjusted with a swipe up or down.
+@MainActor
+final class TrimAccessibilityElement: UIAccessibilityElement {
+
+    enum Part: Sendable { case start, position, end }
+
+    let part: Part
+
+    init(scrubber: TrimScrubberView, part: Part) {
+        self.part = part
+        super.init(accessibilityContainer: scrubber)
+        accessibilityTraits = .adjustable
+    }
+
+    private var scrubber: TrimScrubberView? { accessibilityContainer as? TrimScrubberView }
+
+    override var accessibilityLabel: String? {
+        get {
+            switch part {
+            case .start:    return L10n.trimStart
+            case .position: return L10n.playbackPosition
+            case .end:      return L10n.trimEnd
+            }
+        }
+        set {}
+    }
+
+    override var accessibilityValue: String? {
+        get { scrubber?.spokenValue(for: part) }
+        set {}
+    }
+
+    override var accessibilityFrameInContainerSpace: CGRect {
+        get { scrubber?.elementFrame(for: part) ?? .zero }
+        set {}
+    }
+
+    override func accessibilityIncrement() { scrubber?.stepAccessibility(part, direction: 1) }
+    override func accessibilityDecrement() { scrubber?.stepAccessibility(part, direction: -1) }
 }
 
 /// Carries a non-`Sendable` value across a concurrency boundary. Used for the

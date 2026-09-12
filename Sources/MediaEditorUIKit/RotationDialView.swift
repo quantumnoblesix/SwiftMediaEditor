@@ -50,7 +50,9 @@ final class RotationDialView: UIView {
 
         label.text = "0°"
         label.textColor = .systemYellow
-        label.font = .systemFont(ofSize: 13, weight: .semibold)
+        label.font = EditorAccessibility.scaledFont(.systemFont(ofSize: 13, weight: .semibold),
+                                                   textStyle: .footnote, maximumPointSize: 15)
+        label.adjustsFontForContentSizeCategory = true
         label.textAlignment = .center
         label.translatesAutoresizingMaskIntoConstraints = false
         addSubview(label)
@@ -60,6 +62,12 @@ final class RotationDialView: UIView {
         ])
 
         addGestureRecognizer(UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:))))
+
+        // The ruler only answers to dragging, so VoiceOver gets one adjustable
+        // element instead: swipe up or down to straighten a degree at a time.
+        isAccessibilityElement = true
+        accessibilityTraits = .adjustable
+        accessibilityLabel = L10n.straighten
     }
 
     @available(*, unavailable)
@@ -83,6 +91,26 @@ final class RotationDialView: UIView {
         default:
             break
         }
+    }
+
+    // MARK: - Accessibility
+
+    override var accessibilityValue: String? {
+        get { "\(Int(degrees.rounded()))°" }
+        set {}
+    }
+
+    override func accessibilityIncrement() { step(up: true) }
+    override func accessibilityDecrement() { step(up: false) }
+
+    /// Moves to the next whole degree and commits it, as a finished drag would.
+    private func step(up: Bool) {
+        let next = up ? degrees.rounded(.down) + 1 : degrees.rounded(.up) - 1
+        let target = min(max(next, -range), range)
+        guard target != degrees else { return }
+        degrees = target
+        delegate?.rotationDial(self, didChangeTo: degrees)
+        delegate?.rotationDialDidCommit(self)
     }
 
     override func draw(_ rect: CGRect) {

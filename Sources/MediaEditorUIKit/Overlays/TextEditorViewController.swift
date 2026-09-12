@@ -31,6 +31,11 @@ final class TextEditorViewController: UIViewController, UITextViewDelegate {
         RGBAColor(red: 0.2, green: 0.6, blue: 1),     // blue
         RGBAColor(red: 0.3, green: 0.85, blue: 0.4),  // green
     ]
+    /// What VoiceOver calls each swatch, in the same order as `swatchColors`.
+    private var swatchNames: [String] {
+        [L10n.colorWhite, L10n.colorBlack, L10n.colorRed, L10n.colorYellow, L10n.colorBlue, L10n.colorGreen]
+    }
+    private var swatchButtons: [UIButton] = []
 
     private let appearance: EditorAppearance
 
@@ -49,6 +54,9 @@ final class TextEditorViewController: UIViewController, UITextViewDelegate {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = UIColor.black.withAlphaComponent(0.85)
+        // The editor stays in the view hierarchy underneath; keep VoiceOver from
+        // wandering into it.
+        view.accessibilityViewIsModal = true
 
         let cancel = UIButton(type: .system)
         appearance.styleBarButton(cancel, title: L10n.cancel, role: .dismissing)
@@ -68,6 +76,7 @@ final class TextEditorViewController: UIViewController, UITextViewDelegate {
         textView.textAlignment = .center
         textView.text = style.string
         textView.delegate = self
+        textView.accessibilityLabel = L10n.textField
         textView.translatesAutoresizingMaskIntoConstraints = false
         textView.keyboardAppearance = .dark
 
@@ -75,22 +84,24 @@ final class TextEditorViewController: UIViewController, UITextViewDelegate {
         swatches.distribution = .equalSpacing
         swatches.translatesAutoresizingMaskIntoConstraints = false
         for (index, color) in swatchColors.enumerated() {
-            let button = UIButton(type: .system)
+            let button = TouchTargetButton(type: .system)
             button.backgroundColor = color.uiColor
             button.layer.cornerRadius = 16
-            button.layer.borderWidth = 2
-            button.layer.borderColor = UIColor.white.withAlphaComponent(0.6).cgColor
             button.tag = index
+            // A swatch is only a colour on screen; VoiceOver needs its name.
+            button.accessibilityLabel = swatchNames[index]
             button.addTarget(self, action: #selector(colorTapped(_:)), for: .touchUpInside)
             button.translatesAutoresizingMaskIntoConstraints = false
             button.widthAnchor.constraint(equalToConstant: 32).isActive = true
             button.heightAnchor.constraint(equalToConstant: 32).isActive = true
             swatches.addArrangedSubview(button)
+            swatchButtons.append(button)
         }
 
         // A full color picker for any custom color beyond the preset swatches.
-        let picker = UIButton(type: .system)
+        let picker = TouchTargetButton(type: .system)
         picker.setImage(UIImage(systemName: "paintpalette.fill"), for: .normal)
+        picker.accessibilityLabel = L10n.moreColors
         picker.tintColor = .white
         picker.backgroundColor = UIColor.white.withAlphaComponent(0.15)
         picker.layer.cornerRadius = 16
@@ -99,6 +110,7 @@ final class TextEditorViewController: UIViewController, UITextViewDelegate {
         picker.widthAnchor.constraint(equalToConstant: 32).isActive = true
         picker.heightAnchor.constraint(equalToConstant: 32).isActive = true
         swatches.addArrangedSubview(picker)
+        updateSwatchSelection()
 
         [topBar, textView, swatches].forEach(view.addSubview)
         NSLayoutConstraint.activate([
@@ -122,10 +134,17 @@ final class TextEditorViewController: UIViewController, UITextViewDelegate {
         textView.becomeFirstResponder()
     }
 
+    /// VoiceOver's two-finger scrub closes without saving, like Cancel.
+    override func accessibilityPerformEscape() -> Bool {
+        cancelTapped()
+        return true
+    }
+
     @objc private func colorTapped(_ sender: UIButton) {
         let color = swatchColors[sender.tag]
         style.color = color
         textView.textColor = color.uiColor
+        updateSwatchSelection()
     }
 
     @objc private func presentColorPicker() {
@@ -139,6 +158,19 @@ final class TextEditorViewController: UIViewController, UITextViewDelegate {
     private func applyPickedColor(_ color: UIColor) {
         style.color = RGBAColor(color)
         textView.textColor = color
+        updateSwatchSelection()
+    }
+
+    /// Marks the swatch that matches the text colour: a solid, thicker ring on
+    /// screen — a cue that doesn't rely on telling colours apart — and the
+    /// selected trait for VoiceOver. A custom picked colour matches none.
+    private func updateSwatchSelection() {
+        for (index, button) in swatchButtons.enumerated() {
+            let selected = swatchColors[index] == style.color
+            button.layer.borderWidth = selected ? 3 : 2
+            button.layer.borderColor = UIColor.white.withAlphaComponent(selected ? 1 : 0.6).cgColor
+            button.accessibilityTraits = selected ? [.button, .selected] : .button
+        }
     }
 
     @objc private func cancelTapped() {
@@ -156,6 +188,16 @@ extension TextEditorViewController: UIColorPickerViewControllerDelegate {
     func colorPickerViewController(_ viewController: UIColorPickerViewController,
                                    didSelect color: UIColor, continuously: Bool) {
         applyPickedColor(color)
+    }
+}
+
+/// A button drawn smaller than the 44-point minimum touch target, with its hit
+/// area grown to meet it.
+private final class TouchTargetButton: UIButton {
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        let dx = max(0, (44 - bounds.width) / 2)
+        let dy = max(0, (44 - bounds.height) / 2)
+        return bounds.insetBy(dx: -dx, dy: -dy).contains(point)
     }
 }
 

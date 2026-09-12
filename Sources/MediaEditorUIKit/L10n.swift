@@ -34,6 +34,13 @@ enum L10n {
         "export.failed.title", "export.progress",
         "filter.original", "filter.vivid", "filter.mono", "filter.noir",
         "filter.fade", "filter.chrome", "filter.sepia", "filter.invert",
+        "a11y.straighten", "a11y.crop.area", "a11y.crop.size", "a11y.move.up",
+        "a11y.move.down", "a11y.move.left", "a11y.move.right", "a11y.sticker.bigger",
+        "a11y.sticker.smaller", "a11y.sticker.rotate.left", "a11y.sticker.rotate.right", "a11y.sticker.edit",
+        "a11y.deleted", "a11y.trim.start", "a11y.trim.end", "a11y.playback.position",
+        "a11y.playback.time", "a11y.time.of", "a11y.canvas", "crop.reset",
+        "text.field", "text.color.more", "color.white", "color.black",
+        "color.red", "color.yellow", "color.blue", "color.green",
     ]
 
     /// Languages shipped with the package.
@@ -103,4 +110,53 @@ enum L10n {
     static func exportProgress(percent: Int) -> String {
         String(format: string("export.progress", "Export progress; %d is the percentage"), percent)
     }
+
+    // Accessibility: names, values and actions VoiceOver speaks
+    static var straighten: String { string("a11y.straighten", "VoiceOver name of the straighten dial") }
+    static var cropArea: String { string("a11y.crop.area", "VoiceOver name of the crop frame") }
+
+    /// The crop frame's size, e.g. "80% of the width, 60% of the height".
+    static func cropSize(widthPercent: Int, heightPercent: Int) -> String {
+        String(format: string("a11y.crop.size",
+                              "Crop frame size; %1$d and %2$d are percentages of the width and height"),
+               widthPercent, heightPercent)
+    }
+
+    static var moveUp: String { string("a11y.move.up", "VoiceOver action moving the crop frame or a sticker up") }
+    static var moveDown: String { string("a11y.move.down", "VoiceOver action moving the crop frame or a sticker down") }
+    static var moveLeft: String { string("a11y.move.left", "VoiceOver action moving the crop frame or a sticker left") }
+    static var moveRight: String { string("a11y.move.right", "VoiceOver action moving the crop frame or a sticker right") }
+    static var makeBigger: String { string("a11y.sticker.bigger", "VoiceOver action enlarging a sticker") }
+    static var makeSmaller: String { string("a11y.sticker.smaller", "VoiceOver action shrinking a sticker") }
+    static var rotateLeft: String {
+        string("a11y.sticker.rotate.left", "VoiceOver action rotating a sticker counterclockwise")
+    }
+    static var rotateRight: String { string("a11y.sticker.rotate.right", "VoiceOver action rotating a sticker clockwise") }
+    static var editText: String { string("a11y.sticker.edit", "VoiceOver action reopening a text sticker for editing") }
+    static var deleted: String { string("a11y.deleted", "Spoken after a sticker is deleted") }
+    static var trimStart: String { string("a11y.trim.start", "VoiceOver name of the trimmer's start handle") }
+    static var trimEnd: String { string("a11y.trim.end", "VoiceOver name of the trimmer's end handle") }
+    static var playbackPosition: String { string("a11y.playback.position", "VoiceOver name of the trimmer's playhead") }
+    static var playbackTime: String {
+        string("a11y.playback.time", "VoiceOver name of the elapsed / total time readout")
+    }
+
+    /// Elapsed against total time, e.g. "2.5 seconds of 10.0 seconds".
+    static func timeOf(elapsed: String, total: String) -> String {
+        String(format: string("a11y.time.of", "Elapsed against total time; %1$@ is elapsed, %2$@ is total"),
+               elapsed, total)
+    }
+
+    static var drawingCanvas: String { string("a11y.canvas", "VoiceOver name of the drawing area") }
+    static var resetCrop: String { string("crop.reset", "Resets the crop frame and straightening") }
+
+    // Text editor
+    static var textField: String { string("text.field", "VoiceOver name of the text being typed") }
+    static var moreColors: String { string("text.color.more", "Opens the full color picker") }
+    static var colorWhite: String { string("color.white", "Text color swatch") }
+    static var colorBlack: String { string("color.black", "Text color swatch") }
+    static var colorRed: String { string("color.red", "Text color swatch") }
+    static var colorYellow: String { string("color.yellow", "Text color swatch") }
+    static var colorBlue: String { string("color.blue", "Text color swatch") }
+    static var colorGreen: String { string("color.green", "Text color swatch") }
 }

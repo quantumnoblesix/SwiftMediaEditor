@@ -6,6 +6,29 @@ All notable changes to this package are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- VoiceOver can do everything touch can. The straighten dial, crop frame and
+  trim handles are adjustable with a swipe up or down. Stickers have actions to
+  resize, rotate, move, edit and delete. Filters, text colours and aspect ratios
+  are named and announce which one is selected. VoiceOver moves to a tool's title
+  when it opens, the two-finger double-tap plays or pauses a video, and the
+  escape gesture cancels an open tool.
+- Reduce Motion replaces blooming and springing with fades, and Smart Invert
+  leaves photos, video, thumbnails and stickers alone.
+- Chrome text follows Dynamic Type, capped where a bar has fixed room, and icon
+  buttons show in the large content viewer at accessibility sizes.
+- The text colour swatches have 44-point touch targets, and the current colour
+  gets a solid ring.
+
+### Fixed
+
+- VoiceOver and Switch Control users can pause a playing video: the play button
+  no longer fades out of their reach during playback.
+- At the largest text sizes, Cancel, Done, Apply and the aspect ratio buttons
+  no longer wrap and swell over the preview: their titles stop growing at 22
+  points, and a long press shows them in the large content viewer.
+
 ## [1.0.0] - 2026-09-12
 
 The first public release.

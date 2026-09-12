@@ -113,6 +113,10 @@ public struct EditorAppearance {
         }
     }
 
+    /// The largest a bar title grows with Dynamic Type; the large content viewer
+    /// takes over beyond it.
+    nonisolated static let barTitleMaximumPointSize: CGFloat = 22
+
     /// Styles a bar text button (Cancel / Done / Apply). The confirming role
     /// becomes a tinted prominent glass capsule on iOS 26.
     public func styleBarButton(_ button: UIButton, title: String, role: EditorBarButtonRole) {
@@ -123,6 +127,17 @@ public struct EditorAppearance {
                 ? UIButton.Configuration.prominentGlass()
                 : UIButton.Configuration.glass()
             config.title = title
+            // Glass titles follow Dynamic Type with no ceiling of their own; at the
+            // accessibility sizes a two-word bar wrapped and swelled over the
+            // preview. Keep the system's font, capped, on one line.
+            config.titleLineBreakMode = .byTruncatingTail
+            let ceiling = Self.barTitleMaximumPointSize
+            config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
+                var outgoing = incoming
+                let font = incoming.uiKit.font ?? UIFont.preferredFont(forTextStyle: .body)
+                outgoing.uiKit.font = font.withSize(min(font.pointSize, ceiling))
+                return outgoing
+            }
             if prominent {
                 config.baseBackgroundColor = colour
             } else {
@@ -132,8 +147,15 @@ public struct EditorAppearance {
         } else {
             button.setTitle(title, for: .normal)
             button.setTitleColor(colour, for: .normal)
-            button.titleLabel?.font = prominent ? .boldSystemFont(ofSize: 16) : .systemFont(ofSize: 15)
+            button.titleLabel?.font = EditorAccessibility.scaledFont(
+                prominent ? .boldSystemFont(ofSize: 16) : .systemFont(ofSize: 15),
+                textStyle: .body, maximumPointSize: Self.barTitleMaximumPointSize)
+            button.titleLabel?.adjustsFontForContentSizeCategory = true
+            button.titleLabel?.lineBreakMode = .byTruncatingTail
         }
+        // Past the cap, a long press shows the title at full size.
+        button.showsLargeContentViewer = true
+        button.largeContentTitle = title
         styleBarButton?(button, role)
     }
 
@@ -152,15 +174,25 @@ public struct EditorAppearance {
         }
         button.tintColor = tint
         button.accessibilityLabel = action.localizedTitle
+        // A glyph can't grow with Dynamic Type; at accessibility text sizes a long
+        // press shows the button in the large content viewer instead.
+        button.showsLargeContentViewer = true
+        button.largeContentTitle = action.localizedTitle
+        button.largeContentImage = button.image(for: .normal)
+        button.scalesLargeContentImage = true
         styleToolButton?(button, action)
     }
 
     /// Styles a symbol button that isn't tied to an action (the crop tool's
-    /// reset control, the transport glyph).
+    /// reset control, the transport glyph). A symbol alone has no name: set the
+    /// button's `accessibilityLabel` and `largeContentTitle` too.
     public func styleSymbolButton(_ button: UIButton, symbol: String, pointSize: CGFloat? = nil) {
         let config = UIImage.SymbolConfiguration(pointSize: pointSize ?? toolSymbolPointSize, weight: .regular)
         button.setImage(UIImage(systemName: symbol, withConfiguration: config), for: .normal)
         button.tintColor = tint
+        button.showsLargeContentViewer = true
+        button.largeContentImage = button.image(for: .normal)
+        button.scalesLargeContentImage = true
     }
 }
 

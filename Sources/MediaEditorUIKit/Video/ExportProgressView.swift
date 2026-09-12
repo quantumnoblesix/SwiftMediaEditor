@@ -36,10 +36,16 @@ final class ExportProgressView: UIView {
 
     private func setup() {
         backgroundColor = UIColor.black.withAlphaComponent(0.7)
+        // The editor behind the panel is on hold until the export ends.
+        accessibilityViewIsModal = true
 
         label.text = L10n.exportProgress(percent: 0)
         label.textColor = appearance.tint
-        label.font = .systemFont(ofSize: 15, weight: .medium)
+        label.font = EditorAccessibility.scaledFont(.systemFont(ofSize: 15, weight: .medium),
+                                                   textStyle: .subheadline, maximumPointSize: 28)
+        label.adjustsFontForContentSizeCategory = true
+        label.numberOfLines = 0
+        label.accessibilityTraits.insert(.updatesFrequently)
         label.textAlignment = .center
 
         progressView.progressTintColor = appearance.accent
@@ -48,6 +54,9 @@ final class ExportProgressView: UIView {
         let cancel = UIButton(type: .system)
         cancel.setTitle(L10n.cancel, for: .normal)
         cancel.setTitleColor(.white, for: .normal)
+        cancel.titleLabel?.font = EditorAccessibility.scaledFont(.systemFont(ofSize: 17), textStyle: .body,
+                                                                maximumPointSize: 28)
+        cancel.titleLabel?.adjustsFontForContentSizeCategory = true
         cancel.addTarget(self, action: #selector(cancelTapped), for: .touchUpInside)
 
         let stack = UIStackView(arrangedSubviews: [label, progressView, cancel])
@@ -72,6 +81,12 @@ final class ExportProgressView: UIView {
             stack.topAnchor.constraint(equalTo: panel.contentView.topAnchor, constant: 24),
             stack.bottomAnchor.constraint(equalTo: panel.contentView.bottomAnchor, constant: -24),
         ])
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        // Put VoiceOver on the progress straight away, not wherever it was in the editor.
+        if window != nil { UIAccessibility.post(notification: .screenChanged, argument: label) }
     }
 
     func setProgress(_ progress: Float) {

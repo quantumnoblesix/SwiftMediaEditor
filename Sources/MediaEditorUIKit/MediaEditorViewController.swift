@@ -175,6 +175,10 @@ public final class MediaEditorViewController: UIViewController {
     private let canvasView = PKCanvasView()
     private let toolPicker = PKToolPicker()
     private let drawTopBar = UIStackView()
+    /// The tool titles, which VoiceOver moves to when a tool opens.
+    private let cropTitleLabel = UILabel()
+    private let drawTitleLabel = UILabel()
+    private let filterTitleLabel = UILabel()
 
     // Filter-mode chrome.
     private let filterTopBar = UIStackView()
@@ -248,6 +252,12 @@ public final class MediaEditorViewController: UIViewController {
         renderPreview()
         overlayContainer.reload(overlays: recipe.overlays, images: overlayImages)
         updateHistoryButtons()
+        // Icon buttons show in the large content viewer at accessibility text
+        // sizes; the interaction has to live on an ancestor.
+        view.addInteraction(UILargeContentViewerInteraction())
+        NotificationCenter.default.addObserver(self, selector: #selector(differentiateWithoutColorChanged),
+                                               name: UIAccessibility.differentiateWithoutColorDidChangeNotification,
+                                               object: nil)
     }
 
     public override func viewDidLayoutSubviews() {
@@ -303,6 +313,8 @@ public final class MediaEditorViewController: UIViewController {
 
     private func setupPreview() {
         view.addSubview(imageView)
+        // Photos and video frames keep their colours under Smart Invert.
+        imageView.accessibilityIgnoresInvertColors = true
         NSLayoutConstraint.activate([
             imageView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
             imageView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
@@ -437,10 +449,8 @@ public final class MediaEditorViewController: UIViewController {
     private func setupCropChrome() {
         // Crop top bar: Cancel / "Crop" / Apply
         let cancel = makeTextButton(L10n.cancel, role: .dismissing, action: #selector(cancelCropTapped))
-        let title = UILabel()
-        title.text = L10n.cropTitle
-        title.textColor = .white
-        title.font = .boldSystemFont(ofSize: 16)
+        let title = cropTitleLabel
+        styleToolTitle(title, text: L10n.cropTitle)
         let apply = makeTextButton(L10n.apply, role: .confirming, action: #selector(applyCropTapped))
         cropTopBar.axis = .horizontal
         cropTopBar.alignment = .center
@@ -486,6 +496,8 @@ public final class MediaEditorViewController: UIViewController {
             cropAspectBar.addArrangedSubview(button)
         }
         let reset = makeSymbolButton(symbol: "arrow.counterclockwise", selector: #selector(resetCropTapped))
+        reset.accessibilityLabel = L10n.resetCrop
+        reset.largeContentTitle = L10n.resetCrop
         cropAspectBar.addArrangedSubview(reset)
         cropAspectBar.translatesAutoresizingMaskIntoConstraints = false
         // More presets than fit the width (Original + Free + four ratios + reset
@@ -537,10 +549,8 @@ public final class MediaEditorViewController: UIViewController {
 
     private func setupDrawChrome() {
         let cancel = makeTextButton(L10n.cancel, role: .dismissing, action: #selector(cancelDrawTapped))
-        let title = UILabel()
-        title.text = L10n.drawTitle
-        title.textColor = .white
-        title.font = .boldSystemFont(ofSize: 16)
+        let title = drawTitleLabel
+        styleToolTitle(title, text: L10n.drawTitle)
         let done = makeTextButton(L10n.done, role: .confirming, action: #selector(applyDrawTapped))
         drawTopBar.axis = .horizontal
         drawTopBar.alignment = .center
@@ -553,6 +563,8 @@ public final class MediaEditorViewController: UIViewController {
         view.addSubview(drawTopBar)
 
         canvasView.drawingPolicy = .anyInput          // allow finger drawing (and simulator)
+        canvasView.accessibilityLabel = L10n.drawingCanvas
+        canvasView.accessibilityIgnoresInvertColors = true
         canvasView.backgroundColor = .clear
         canvasView.isOpaque = false
         canvasView.alwaysBounceVertical = false
@@ -567,10 +579,8 @@ public final class MediaEditorViewController: UIViewController {
 
     private func setupFilterChrome() {
         let cancel = makeTextButton(L10n.cancel, role: .dismissing, action: #selector(cancelFilterTapped))
-        let title = UILabel()
-        title.text = L10n.filtersTitle
-        title.textColor = .white
-        title.font = .boldSystemFont(ofSize: 16)
+        let title = filterTitleLabel
+        styleToolTitle(title, text: L10n.filtersTitle)
         let done = makeTextButton(L10n.done, role: .confirming, action: #selector(applyFilterTapped))
         filterTopBar.axis = .horizontal
         filterTopBar.alignment = .center
@@ -666,6 +676,17 @@ public final class MediaEditorViewController: UIViewController {
         appearance.styleBarButton(button, title: title, role: role)
         button.addTarget(self, action: action, for: .touchUpInside)
         return button
+    }
+
+    /// A tool's title in its top bar: a heading VoiceOver can jump to, sized with
+    /// Dynamic Type up to what the bar has room for.
+    private func styleToolTitle(_ title: UILabel, text: String) {
+        title.text = text
+        title.textColor = .white
+        title.font = EditorAccessibility.scaledFont(.boldSystemFont(ofSize: 16), textStyle: .headline,
+                                                   maximumPointSize: 22)
+        title.adjustsFontForContentSizeCategory = true
+        title.accessibilityTraits = .header
     }
 
     private func label(for preset: AspectPreset) -> String {
@@ -816,6 +837,7 @@ public final class MediaEditorViewController: UIViewController {
         for chrome in [cropTopBar, cropToolsBackground, rotationDial, cropAspectBarBackground] {
             view.bringSubviewToFront(chrome)
         }
+        UIAccessibility.post(notification: .screenChanged, argument: cropTitleLabel)
     }
 
     /// Total crop rotation, preset + straighten, in degrees.
@@ -911,15 +933,36 @@ public final class MediaEditorViewController: UIViewController {
     }
 
     private func highlightAspectButton(for preset: AspectPreset) {
+        // Colour marks the choice on screen; VoiceOver hears it as selected, and
+        // Differentiate Without Color adds an underline.
+        let underlineSelection = UIAccessibility.shouldDifferentiateWithoutColor
         for (p, button) in aspectButtons {
-            let selected = label(for: p) == label(for: preset)
+            let title = label(for: p)
+            let selected = title == label(for: preset)
+            let underline = selected && underlineSelection
             let tint: UIColor = selected ? .systemYellow : .white
             // Configuration-backed (glass) buttons ignore setTitleColor.
             if button.configuration != nil {
                 button.configuration?.baseForegroundColor = tint
+                if underline {
+                    var attributed = AttributedString(title)
+                    // Named through the UIKit scope: left implicit, the key can resolve
+                    // to SwiftUI's attribute, which this module doesn't link.
+                    attributed.uiKit.underlineStyle = .single
+                    button.configuration?.attributedTitle = attributed
+                } else {
+                    button.configuration?.title = title
+                }
             } else {
                 button.setTitleColor(tint, for: .normal)
+                let underlined = NSAttributedString(string: title, attributes: [
+                    .underlineStyle: NSUnderlineStyle.single.rawValue,
+                    .foregroundColor: tint,
+                    .font: button.titleLabel?.font ?? UIFont.systemFont(ofSize: 15),
+                ])
+                button.setAttributedTitle(underline ? underlined : nil, for: .normal)
             }
+            button.accessibilityTraits = selected ? [.button, .selected] : .button
         }
     }
 
@@ -939,6 +982,35 @@ public final class MediaEditorViewController: UIViewController {
         cropToolsBackground.isHidden = true
         rotationDial.isHidden = true
         cropAspectBarBackground.isHidden = true
+        UIAccessibility.post(notification: .screenChanged, argument: nil)
+    }
+
+    // MARK: - Accessibility gestures
+
+    /// VoiceOver's two-finger double-tap plays or pauses a video from anywhere,
+    /// as it does in media apps.
+    public override func accessibilityPerformMagicTap() -> Bool {
+        guard case .video = item, mode == .normal, player != nil else { return false }
+        togglePlayback()
+        return true
+    }
+
+    /// VoiceOver's two-finger scrub backs out of the open tool, as its Cancel
+    /// button does. It never dismisses the editor itself: a stray gesture
+    /// shouldn't throw away every edit.
+    public override func accessibilityPerformEscape() -> Bool {
+        switch mode {
+        case .crop:   cancelCropTapped()
+        case .draw:   cancelDrawTapped()
+        case .filter: cancelFilterTapped()
+        case .normal: return false
+        }
+        return true
+    }
+
+    @objc private func differentiateWithoutColorChanged() {
+        guard mode == .crop else { return }
+        highlightAspectButton(for: cropOverlay.aspect)
     }
 
     // MARK: - Video
@@ -997,14 +1069,15 @@ public final class MediaEditorViewController: UIViewController {
 
         // Elapsed / total, just above the filmstrip — or the tool row when trim is
         // off. A fixed height keeps the video from shifting when the text first
-        // appears.
+        // appears; it's measured from the readout's font, which follows Dynamic
+        // Type.
         timeLabel.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(timeLabel)
         NSLayoutConstraint.activate([
             timeLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             timeLabel.bottomAnchor.constraint(equalTo: showsTrimScrubber ? trimScrubber.topAnchor : toolbarTopAnchor,
                                               constant: -8),
-            timeLabel.heightAnchor.constraint(equalToConstant: 16),
+            timeLabel.heightAnchor.constraint(equalToConstant: ceil(timeLabel.font.lineHeight)),
         ])
 
         displayLinkProxy.onTick = { [weak self] in
@@ -1171,6 +1244,7 @@ public final class MediaEditorViewController: UIViewController {
         }
         audioButton.tintColor = muted ? appearance.accent : appearance.tint
         audioButton.accessibilityLabel = muted ? L10n.restoreAudio : L10n.removeAudio
+        audioButton.largeContentTitle = audioButton.accessibilityLabel
         notifyToolbarStateChanged()
     }
 
@@ -1378,6 +1452,7 @@ public final class MediaEditorViewController: UIViewController {
         toolPicker.setVisible(true, forFirstResponder: canvasView)
         toolPicker.addObserver(canvasView)
         canvasView.becomeFirstResponder()
+        UIAccessibility.post(notification: .screenChanged, argument: drawTitleLabel)
     }
 
     /// Loads the recipe's drawing into the canvas, scaling it from its authoring
@@ -1433,6 +1508,7 @@ public final class MediaEditorViewController: UIViewController {
         topBar.isHidden = false
         setMainToolbarHidden(false)
         drawTopBar.isHidden = true
+        UIAccessibility.post(notification: .screenChanged, argument: nil)
     }
 
     // MARK: - Filter mode
@@ -1452,6 +1528,7 @@ public final class MediaEditorViewController: UIViewController {
         setMainToolbarHidden(true)
         filterTopBar.isHidden = false
         filterBarBackground.isHidden = false
+        UIAccessibility.post(notification: .screenChanged, argument: filterTitleLabel)
     }
 
     /// Preview with the working filter (geometry + filter + drawing; overlays stay
@@ -1513,6 +1590,7 @@ public final class MediaEditorViewController: UIViewController {
         setMainToolbarHidden(false)
         filterTopBar.isHidden = true
         filterBarBackground.isHidden = true
+        UIAccessibility.post(notification: .screenChanged, argument: nil)
     }
 
     // MARK: - Overlays (stickers)

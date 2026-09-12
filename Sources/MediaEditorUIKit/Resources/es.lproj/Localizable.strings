@@ -63,3 +63,60 @@
 
 /* Removes a sticker or text overlay; offered to VoiceOver as an action */
 "action.delete" = "Eliminar";
+
+/* VoiceOver name of the straighten dial */
+"a11y.straighten" = "Enderezar";
+/* VoiceOver name of the crop frame */
+"a11y.crop.area" = "Área de recorte";
+/* Crop frame size; %1$d and %2$d are percentages of the width and height */
+"a11y.crop.size" = "%1$d %% del ancho, %2$d %% del alto";
+/* VoiceOver action moving the crop frame or a sticker up */
+"a11y.move.up" = "Mover hacia arriba";
+/* VoiceOver action moving the crop frame or a sticker down */
+"a11y.move.down" = "Mover hacia abajo";
+/* VoiceOver action moving the crop frame or a sticker left */
+"a11y.move.left" = "Mover a la izquierda";
+/* VoiceOver action moving the crop frame or a sticker right */
+"a11y.move.right" = "Mover a la derecha";
+/* VoiceOver action enlarging a sticker */
+"a11y.sticker.bigger" = "Agrandar";
+/* VoiceOver action shrinking a sticker */
+"a11y.sticker.smaller" = "Reducir";
+/* VoiceOver action rotating a sticker counterclockwise */
+"a11y.sticker.rotate.left" = "Girar a la izquierda";
+/* VoiceOver action rotating a sticker clockwise */
+"a11y.sticker.rotate.right" = "Girar a la derecha";
+/* VoiceOver action reopening a text sticker for editing */
+"a11y.sticker.edit" = "Editar texto";
+/* Spoken after a sticker is deleted */
+"a11y.deleted" = "Eliminado";
+/* VoiceOver name of the trimmer's start handle */
+"a11y.trim.start" = "Inicio del recorte";
+/* VoiceOver name of the trimmer's end handle */
+"a11y.trim.end" = "Fin del recorte";
+/* VoiceOver name of the trimmer's playhead */
+"a11y.playback.position" = "Posición de reproducción";
+/* VoiceOver name of the elapsed / total time readout */
+"a11y.playback.time" = "Tiempo de reproducción";
+/* Elapsed against total time; %1$@ is elapsed, %2$@ is total */
+"a11y.time.of" = "%1$@ de %2$@";
+/* VoiceOver name of the drawing area */
+"a11y.canvas" = "Lienzo de dibujo";
+/* Resets the crop frame and straightening */
+"crop.reset" = "Restablecer";
+/* VoiceOver name of the text being typed */
+"text.field" = "Texto";
+/* Opens the full color picker */
+"text.color.more" = "Más colores";
+/* Text color swatch */
+"color.white" = "Blanco";
+/* Text color swatch */
+"color.black" = "Negro";
+/* Text color swatch */
+"color.red" = "Rojo";
+/* Text color swatch */
+"color.yellow" = "Amarillo";
+/* Text color swatch */
+"color.blue" = "Azul";
+/* Text color swatch */
+"color.green" = "Verde";

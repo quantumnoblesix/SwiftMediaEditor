@@ -63,3 +63,60 @@
 
 /* Removes a sticker or text overlay; offered to VoiceOver as an action */
 "action.delete" = "Supprimer";
+
+/* VoiceOver name of the straighten dial */
+"a11y.straighten" = "Redresser";
+/* VoiceOver name of the crop frame */
+"a11y.crop.area" = "Zone de recadrage";
+/* Crop frame size; %1$d and %2$d are percentages of the width and height */
+"a11y.crop.size" = "%1$d %% de la largeur, %2$d %% de la hauteur";
+/* VoiceOver action moving the crop frame or a sticker up */
+"a11y.move.up" = "Déplacer vers le haut";
+/* VoiceOver action moving the crop frame or a sticker down */
+"a11y.move.down" = "Déplacer vers le bas";
+/* VoiceOver action moving the crop frame or a sticker left */
+"a11y.move.left" = "Déplacer vers la gauche";
+/* VoiceOver action moving the crop frame or a sticker right */
+"a11y.move.right" = "Déplacer vers la droite";
+/* VoiceOver action enlarging a sticker */
+"a11y.sticker.bigger" = "Agrandir";
+/* VoiceOver action shrinking a sticker */
+"a11y.sticker.smaller" = "Réduire";
+/* VoiceOver action rotating a sticker counterclockwise */
+"a11y.sticker.rotate.left" = "Faire pivoter vers la gauche";
+/* VoiceOver action rotating a sticker clockwise */
+"a11y.sticker.rotate.right" = "Faire pivoter vers la droite";
+/* VoiceOver action reopening a text sticker for editing */
+"a11y.sticker.edit" = "Modifier le texte";
+/* Spoken after a sticker is deleted */
+"a11y.deleted" = "Supprimé";
+/* VoiceOver name of the trimmer's start handle */
+"a11y.trim.start" = "Début du découpage";
+/* VoiceOver name of the trimmer's end handle */
+"a11y.trim.end" = "Fin du découpage";
+/* VoiceOver name of the trimmer's playhead */
+"a11y.playback.position" = "Position de lecture";
+/* VoiceOver name of the elapsed / total time readout */
+"a11y.playback.time" = "Temps de lecture";
+/* Elapsed against total time; %1$@ is elapsed, %2$@ is total */
+"a11y.time.of" = "%1$@ sur %2$@";
+/* VoiceOver name of the drawing area */
+"a11y.canvas" = "Zone de dessin";
+/* Resets the crop frame and straightening */
+"crop.reset" = "Réinitialiser";
+/* VoiceOver name of the text being typed */
+"text.field" = "Texte";
+/* Opens the full color picker */
+"text.color.more" = "Plus de couleurs";
+/* Text color swatch */
+"color.white" = "Blanc";
+/* Text color swatch */
+"color.black" = "Noir";
+/* Text color swatch */
+"color.red" = "Rouge";
+/* Text color swatch */
+"color.yellow" = "Jaune";
+/* Text color swatch */
+"color.blue" = "Bleu";
+/* Text color swatch */
+"color.green" = "Vert";

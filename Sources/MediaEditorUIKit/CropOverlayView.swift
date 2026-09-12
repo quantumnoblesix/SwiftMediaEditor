@@ -83,6 +83,18 @@ final class CropOverlayView: UIView {
         isOpaque = false
         contentMode = .redraw
         addGestureRecognizer(UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:))))
+
+        // The frame is one adjustable element for VoiceOver: swipe up or down to
+        // grow or shrink it, and use the actions to move it.
+        isAccessibilityElement = true
+        accessibilityTraits = .adjustable
+        accessibilityLabel = L10n.cropArea
+        accessibilityCustomActions = [
+            moveAction(L10n.moveUp, dx: 0, dy: -1),
+            moveAction(L10n.moveDown, dx: 0, dy: 1),
+            moveAction(L10n.moveLeft, dx: -1, dy: 0),
+            moveAction(L10n.moveRight, dx: 1, dy: 0),
+        ]
     }
 
     @available(*, unavailable)
@@ -237,6 +249,70 @@ final class CropOverlayView: UIView {
         )
         rect = clamp(rect, keepingSizeWithin: bounds)
         cropRect = rect
+    }
+
+    // MARK: - Accessibility
+
+    /// How far one VoiceOver step resizes or moves the frame, as a fraction of
+    /// the area it may occupy.
+    private let accessibilityStep: CGFloat = 0.1
+
+    override var accessibilityValue: String? {
+        get {
+            let crop = normalizedCropRect()
+            return L10n.cropSize(widthPercent: Int((crop.size.width * 100).rounded()),
+                                 heightPercent: Int((crop.size.height * 100).rounded()))
+        }
+        set {}
+    }
+
+    /// The crop itself rather than the whole overlay, so VoiceOver outlines what
+    /// it adjusts.
+    override var accessibilityFrame: CGRect {
+        get { UIAccessibility.convertToScreenCoordinates(cropRect, in: self) }
+        set {}
+    }
+
+    override func accessibilityIncrement() { resizeForAccessibility(growing: true) }
+    override func accessibilityDecrement() { resizeForAccessibility(growing: false) }
+
+    /// Grows or shrinks the crop about its centre by one step. Width and height
+    /// scale together, so its shape — and any locked ratio — holds, and it stays
+    /// inside the allowed area and above the minimum size.
+    func resizeForAccessibility(growing: Bool) {
+        let bounds = clampRect
+        guard bounds.width > 0, bounds.height > 0, cropRect.width > 0, cropRect.height > 0 else { return }
+        let factor = growing ? 1 + accessibilityStep : 1 / (1 + accessibilityStep)
+        let scaled = CGSize(width: cropRect.width * factor, height: cropRect.height * factor)
+        let fit = min(1, bounds.width / scaled.width, bounds.height / scaled.height)
+        let lift = max(1, minCropSide / (scaled.width * fit), minCropSide / (scaled.height * fit))
+        let size = CGSize(width: scaled.width * fit * lift, height: scaled.height * fit * lift)
+        let center = CGPoint(x: cropRect.midX, y: cropRect.midY)
+        cropRect = clamp(CGRect(x: center.x - size.width / 2, y: center.y - size.height / 2,
+                                width: size.width, height: size.height),
+                         keepingSizeWithin: bounds)
+    }
+
+    /// Moves the crop one step, clamped to the allowed area.
+    func moveForAccessibility(dx: CGFloat, dy: CGFloat) {
+        let bounds = clampRect
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        let moved = cropRect.offsetBy(dx: dx * bounds.width * accessibilityStep,
+                                      dy: dy * bounds.height * accessibilityStep)
+        cropRect = clamp(moved, keepingSizeWithin: bounds)
+        // Keep VoiceOver on the frame as it moves, and read out where it is now.
+        UIAccessibility.post(notification: .layoutChanged, argument: self)
+    }
+
+    private func moveAction(_ name: String, dx: CGFloat, dy: CGFloat) -> UIAccessibilityCustomAction {
+        UIAccessibilityCustomAction(name: name) { [weak self] _ in
+            // Accessibility actions are delivered on the main thread.
+            MainActor.assumeIsolated {
+                guard let self else { return false }
+                self.moveForAccessibility(dx: dx, dy: dy)
+                return true
+            }
+        }
     }
 
     // MARK: - Clamping

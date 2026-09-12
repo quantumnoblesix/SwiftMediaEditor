@@ -101,8 +101,21 @@ The editor has to stay smooth on older, low-power devices.
 - Every user-facing string goes through `L10n`. Add its key to `L10n.allKeys` and
   to all five `Localizable.strings` files (en, it, fr, es, pt-BR) —
   `LocalizationTests` fail otherwise.
-- Icon-only controls need an accessibility label. Anything done with a gesture,
-  like dragging a sticker onto the bin, also needs a VoiceOver custom action.
+- Icon-only controls need an accessibility label, and icon buttons also need a
+  `largeContentTitle` so the large content viewer can show them.
+- Anything done with a gesture needs a VoiceOver way in: a custom action (the
+  sticker edits), or the adjustable trait for anything slider-like (the straighten
+  dial, the crop frame, the trim handles).
+- A control that gets out of the way must stay reachable while VoiceOver or Switch
+  Control runs (`EditorAccessibility.isAssistiveTechnologyRunning`).
+- Show a selection with more than colour: the selected trait for VoiceOver, and a
+  change of shape or weight on screen.
+- Photos, video frames, thumbnails and stickers set
+  `accessibilityIgnoresInvertColors`.
+- Animations that scale, spring or fly check
+  `EditorAccessibility.prefersReducedMotion` and fall back to a fade.
+- Chrome text follows Dynamic Type through `EditorAccessibility.scaledFont`, with a
+  cap only where the layout has fixed room. Touch targets are at least 44 points.
 
 ## Tests
 

@@ -76,4 +76,15 @@ struct LocalizationTests {
         // The %% escape must not leak through as a literal "%%".
         #expect(!rendered.contains("%%"))
     }
+
+    @Test("Accessibility formats substitute their values",
+          arguments: ["en", "it", "fr", "es", "pt-BR"])
+    func accessibilityFormats(language: String) throws {
+        let bundle = try bundle(for: language)
+        let size = String(format: value("a11y.crop.size", in: bundle), 80, 60)
+        #expect(size.contains("80") && size.contains("60") && size.contains("%") && !size.contains("%%"),
+                "\(language) crop size: \(size)")
+        let time = String(format: value("a11y.time.of", in: bundle), "ELAPSED", "TOTAL")
+        #expect(time.contains("ELAPSED") && time.contains("TOTAL"), "\(language) time: \(time)")
+    }
 }

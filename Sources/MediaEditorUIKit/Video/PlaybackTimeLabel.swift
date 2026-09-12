@@ -59,10 +59,13 @@ final class PlaybackTimeLabel: UILabel {
 
     init(appearance: EditorAppearance) {
         super.init(frame: .zero)
-        font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+        font = EditorAccessibility.scaledFont(.monospacedDigitSystemFont(ofSize: 13, weight: .semibold),
+                                              textStyle: .footnote, maximumPointSize: 18)
+        adjustsFontForContentSizeCategory = true
         textColor = appearance.tint
         textAlignment = .center
         accessibilityTraits.insert(.updatesFrequently)
+        accessibilityLabel = L10n.playbackTime
         isHidden = true
     }
 
@@ -88,6 +91,9 @@ final class PlaybackTimeLabel: UILabel {
         text = Self.format(current, style: style, locale: locale)
             + " / "
             + Self.format(total, style: style, locale: locale)
+        // Read aloud, "0:02.5 / 0:10.0" is a run of digits and colons.
+        accessibilityValue = L10n.timeOf(elapsed: Self.spokenTime(current, locale: locale),
+                                         total: Self.spokenTime(total, locale: locale))
     }
 
     /// Formats `seconds`, truncating to the style's precision rather than
@@ -110,6 +116,17 @@ final class PlaybackTimeLabel: UILabel {
             return Duration.seconds(Int64((value + slack).rounded(.down)))
                 .formatted(.time(pattern: .hourMinuteSecond).locale(locale))
         }
+    }
+
+    /// `seconds` the way VoiceOver should say it — "1 minute, 5.3 seconds" —
+    /// truncated to tenths like the readout itself.
+    nonisolated static func spokenTime(_ seconds: Double, locale: Locale) -> String {
+        let value = seconds.isFinite ? max(0, seconds) : 0
+        let tenths = Int64((value * 10 + 1e-6).rounded(.down))
+        return Duration.milliseconds(tenths * 100)
+            .formatted(.units(allowed: [.hours, .minutes, .seconds], width: .wide,
+                              fractionalPart: .show(length: 1))
+                .locale(locale))
     }
 }
 

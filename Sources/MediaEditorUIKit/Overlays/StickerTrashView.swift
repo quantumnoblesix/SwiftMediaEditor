@@ -26,6 +26,8 @@ import UIKit
 /// keeps tracking the finger the whole way. VoiceOver users delete through the
 /// sticker's own Delete action instead, so the bin stays out of the
 /// accessibility tree.
+///
+/// With Reduce Motion on it fades and fills without swelling or growing in.
 @MainActor
 final class StickerTrashView: UIView {
 
@@ -115,7 +117,9 @@ final class StickerTrashView: UIView {
 
     private func applyState() {
         alpha = isShown ? 1 : 0
-        let scale = isShown ? (isArmed ? Self.armedScale : 1) : Self.hiddenScale
+        let scale = EditorAccessibility.prefersReducedMotion
+            ? 1
+            : (isShown ? (isArmed ? Self.armedScale : 1) : Self.hiddenScale)
         transform = CGAffineTransform(scaleX: scale, y: scale)
         armedFill.alpha = isArmed ? 1 : 0
     }

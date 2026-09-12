@@ -22,6 +22,7 @@ with the same non-destructive engine, usable from both **UIKit** and **SwiftUI**
 | Drag a sticker onto the bin to delete it | ✅ | ✅ |
 | Undo / redo | ✅ | ✅ |
 | Re-editing from a saved recipe | ✅ | ✅ |
+| VoiceOver, Switch Control, Dynamic Type, Reduce Motion | ✅ | ✅ |
 
 Built entirely on Apple frameworks — Core Image, Core Graphics, PencilKit, and
 AVFoundation. No third-party dependencies.
@@ -67,6 +68,17 @@ host values win over the package's:
 ```
 
 Keys are listed in `L10n.allKeys`.
+
+## Accessibility
+
+The editor works with VoiceOver and Switch Control from end to end, and every
+gesture has an equivalent. The straighten dial, crop frame and trim handles are
+adjustable with a swipe up or down, and stickers offer actions to resize, rotate,
+move, edit and delete. A two-finger double-tap plays or pauses a video, and the
+two-finger scrub backs out of an open tool.
+
+It also respects Reduce Motion, Smart Invert and Dynamic Type; icon buttons show
+in the large content viewer at accessibility text sizes.
 
 ## Appearance & custom toolbars
 

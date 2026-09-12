@@ -182,10 +182,14 @@ final class OverlayContainerView: UIView {
         // `applyLayout` no longer runs for a removed sticker, so scaling its
         // transform here is safe. It shrinks *behind* the bin, reading as a drop in.
         let target = trashCenter
-        UIView.animate(withDuration: 0.25, delay: 0, options: [.curveEaseIn],
+        // Reduce Motion keeps the drop to a fade where the sticker was let go.
+        let reduceMotion = EditorAccessibility.prefersReducedMotion
+        UIView.animate(withDuration: reduceMotion ? 0.2 : 0.25, delay: 0, options: [.curveEaseIn],
                        animations: {
-                           sticker.center = target
-                           sticker.transform = sticker.transform.scaledBy(x: 0.05, y: 0.05)
+                           if !reduceMotion {
+                               sticker.center = target
+                               sticker.transform = sticker.transform.scaledBy(x: 0.05, y: 0.05)
+                           }
                            sticker.alpha = 0
                        },
                        completion: { _ in sticker.removeFromSuperview() })
@@ -242,6 +246,9 @@ extension OverlayContainerView: StickerViewDelegate {
         sticker.removeFromSuperview()
         stickers.removeAll { $0 === sticker }
         delegate?.overlayContainerDidCommit(self)
+        // VoiceOver was on the sticker that just went: say so, and let it settle
+        // on something else.
+        UIAccessibility.post(notification: .layoutChanged, argument: L10n.deleted)
     }
 
     func stickerViewDidRequestTextEdit(_ sticker: StickerView) {

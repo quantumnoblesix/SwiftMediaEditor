@@ -72,13 +72,16 @@ final class FilterBarView: UIView {
             thumb.clipsToBounds = true
             thumb.layer.cornerRadius = 8
             thumb.layer.cornerCurve = .continuous
+            thumb.accessibilityIgnoresInvertColors = true   // a photo, not chrome
             thumb.translatesAutoresizingMaskIntoConstraints = false
             thumb.widthAnchor.constraint(equalToConstant: 64).isActive = true
             thumb.heightAnchor.constraint(equalToConstant: 64).isActive = true
 
             let label = UILabel()
             label.text = L10n.filterName(entry.filter)
-            label.font = .systemFont(ofSize: 11, weight: .medium)
+            label.font = EditorAccessibility.scaledFont(.systemFont(ofSize: 11, weight: .medium),
+                                                       textStyle: .caption2, maximumPointSize: 14)
+            label.adjustsFontForContentSizeCategory = true
             label.textColor = .white
             label.textAlignment = .center
 
@@ -97,6 +100,8 @@ final class FilterBarView: UIView {
                 cellStack.topAnchor.constraint(equalTo: button.topAnchor),
                 cellStack.bottomAnchor.constraint(equalTo: button.bottomAnchor),
             ])
+            // The name is drawn inside the button, so VoiceOver needs it spelled out.
+            button.accessibilityLabel = L10n.filterName(entry.filter)
             button.addAction(UIAction { [weak self] _ in self?.select(entry.filter) }, for: .touchUpInside)
 
             stack.addArrangedSubview(button)
@@ -117,6 +122,7 @@ final class FilterBarView: UIView {
             cell.thumb.layer.borderWidth = isSelected ? 2.5 : 0
             cell.thumb.layer.borderColor = UIColor.systemYellow.cgColor
             cell.label.textColor = isSelected ? .systemYellow : .white
+            cell.button.accessibilityTraits = isSelected ? [.button, .selected] : .button
         }
     }
 }

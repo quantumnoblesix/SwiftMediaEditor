@@ -21,6 +21,10 @@ import UIKit
 /// lets it bloom outward as it fades, leaving the frame unobstructed; pausing
 /// springs it back in. While hidden it stops taking touches, so a tap in the
 /// same spot falls through to the canvas and pauses instead.
+///
+/// VoiceOver and Switch Control can't tap the canvas, so while either is running
+/// the control stays put through playback. With Reduce Motion on it fades
+/// without blooming or springing.
 @MainActor
 final class PlayPauseButton: UIControl {
 
@@ -60,8 +64,12 @@ final class PlayPauseButton: UIControl {
         ])
 
         isAccessibilityElement = true
-        accessibilityTraits = .button
         setPlaying(false, animated: false)
+
+        for name in EditorAccessibility.assistiveTechnologyNotifications {
+            NotificationCenter.default.addObserver(self, selector: #selector(assistiveTechnologyChanged),
+                                                   name: name, object: nil)
+        }
     }
 
     @available(*, unavailable)
@@ -74,7 +82,8 @@ final class PlayPauseButton: UIControl {
     // A subtle press-in, since a plain UIControl gives no highlight of its own.
     override var isHighlighted: Bool {
         didSet {
-            guard isHighlighted != oldValue, isUserInteractionEnabled else { return }
+            guard isHighlighted != oldValue, isUserInteractionEnabled,
+                  !EditorAccessibility.prefersReducedMotion else { return }
             UIView.animate(withDuration: 0.12, delay: 0, options: [.allowUserInteraction]) {
                 self.transform = self.isHighlighted ? CGAffineTransform(scaleX: 0.92, y: 0.92) : .identity
             }
@@ -88,7 +97,21 @@ final class PlayPauseButton: UIControl {
         let config = UIImage.SymbolConfiguration(pointSize: 28, weight: .semibold)
         icon.image = UIImage(systemName: playing ? "pause.fill" : "play.fill", withConfiguration: config)
         accessibilityLabel = playing ? L10n.pause : L10n.play
-        setVisible(!playing, animated: animated)
+        // Activating Play starts the video; VoiceOver shouldn't talk over it.
+        accessibilityTraits = playing ? .button : [.button, .startsMediaSession]
+        setVisible(shouldBeVisible, animated: animated)
+    }
+
+    /// Paused — or playing while an assistive technology needs the control
+    /// within reach.
+    private var shouldBeVisible: Bool {
+        !isPlaying || EditorAccessibility.isAssistiveTechnologyRunning
+    }
+
+    /// VoiceOver or Switch Control starting mid-playback brings the control back;
+    /// stopping lets it get out of the way again.
+    @objc private func assistiveTechnologyChanged() {
+        setVisible(shouldBeVisible, animated: false)
     }
 
     // MARK: - Show / hide
@@ -102,10 +125,11 @@ final class PlayPauseButton: UIControl {
     private func setVisible(_ visible: Bool, animated: Bool) {
         // A hidden control must not swallow the tap that pauses playback.
         isUserInteractionEnabled = visible
+        let reduceMotion = EditorAccessibility.prefersReducedMotion
 
         let settled = {
             self.alpha = visible ? 1 : 0
-            self.transform = visible
+            self.transform = visible || reduceMotion
                 ? .identity
                 : CGAffineTransform(scaleX: Self.hiddenScale, y: Self.hiddenScale)
         }
@@ -116,7 +140,10 @@ final class PlayPauseButton: UIControl {
             return
         }
 
-        if visible {
+        if reduceMotion {
+            UIView.animate(withDuration: 0.2, delay: 0, options: [.allowUserInteraction],
+                           animations: settled)
+        } else if visible {
             transform = CGAffineTransform(scaleX: Self.enteringScale, y: Self.enteringScale)
             UIView.animate(withDuration: 0.34, delay: 0, usingSpringWithDamping: 0.62,
                            initialSpringVelocity: 0.4, options: [.allowUserInteraction],

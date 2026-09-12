@@ -110,26 +110,70 @@ final class StickerView: UIView {
         setupGestures()
     }
 
-    /// Deletion is a drag onto the bin, which VoiceOver can't perform — and the
-    /// sticker has no on-screen delete control to fall back on. So the sticker is
-    /// one accessibility element, announced by its content, offering Delete as a
-    /// custom action (swipe up or down to reach it).
+    /// How far one VoiceOver action scales, rotates or moves a sticker.
+    static let accessibilityScaleStep = 1.25
+    static let accessibilityRotationStep = Double.pi / 12      // 15°
+    static let accessibilityMoveStep = 0.05                    // of the canvas
+
+    /// VoiceOver can't perform any of a sticker's gestures — dragging it onto the
+    /// bin, pinching, twisting, dragging, double-tapping text — and there are no
+    /// on-screen controls to fall back on. So the sticker is one accessibility
+    /// element, announced by its content, with each edit as a custom action
+    /// (swipe up or down to reach them).
     private func setupAccessibility() {
         isAccessibilityElement = true
+        // A sticker is part of the picture: Smart Invert leaves its colours alone.
+        accessibilityIgnoresInvertColors = true
+        var actions: [UIAccessibilityCustomAction] = []
         switch overlay.content {
-        case let .text(style): accessibilityLabel = style.string
-        case .image:           accessibilityLabel = L10n.addPhoto
+        case let .text(style):
+            accessibilityLabel = style.string
+            actions.append(customAction(L10n.editText) { $0.delegate?.stickerViewDidRequestTextEdit($0) })
+        case .image:
+            accessibilityLabel = L10n.addPhoto
         }
-        accessibilityCustomActions = [
-            UIAccessibilityCustomAction(name: L10n.delete) { [weak self] _ in
-                // Accessibility actions are delivered on the main thread.
-                MainActor.assumeIsolated {
-                    guard let self else { return false }
-                    self.delegate?.stickerViewDidRequestDelete(self)
-                    return true
-                }
-            },
+        let grow = Self.accessibilityScaleStep
+        let turn = Self.accessibilityRotationStep
+        let move = Self.accessibilityMoveStep
+        actions += [
+            customAction(L10n.makeBigger) { $0.adjustForAccessibility(scale: grow) },
+            customAction(L10n.makeSmaller) { $0.adjustForAccessibility(scale: 1 / grow) },
+            customAction(L10n.rotateLeft) { $0.adjustForAccessibility(rotation: -turn) },
+            customAction(L10n.rotateRight) { $0.adjustForAccessibility(rotation: turn) },
+            customAction(L10n.moveUp) { $0.adjustForAccessibility(dy: -move) },
+            customAction(L10n.moveDown) { $0.adjustForAccessibility(dy: move) },
+            customAction(L10n.moveLeft) { $0.adjustForAccessibility(dx: -move) },
+            customAction(L10n.moveRight) { $0.adjustForAccessibility(dx: move) },
+            customAction(L10n.delete) { $0.delegate?.stickerViewDidRequestDelete($0) },
         ]
+        accessibilityCustomActions = actions
+    }
+
+    private func customAction(_ name: String,
+                              _ perform: @escaping @MainActor @Sendable (StickerView) -> Void)
+        -> UIAccessibilityCustomAction {
+        UIAccessibilityCustomAction(name: name) { [weak self] _ in
+            // Accessibility actions are delivered on the main thread.
+            MainActor.assumeIsolated {
+                guard let self else { return false }
+                perform(self)
+                return true
+            }
+        }
+    }
+
+    /// Applies one VoiceOver edit and records it as its own history step, the
+    /// way a finished gesture would.
+    private func adjustForAccessibility(scale factor: Double = 1, rotation: Double = 0,
+                                        dx: Double = 0, dy: Double = 0) {
+        overlay.transform.scale = min(max(overlay.transform.scale * factor, 0.1), 10)
+        overlay.transform.rotation += rotation
+        overlay.transform.center.x = min(max(overlay.transform.center.x + dx, 0), 1)
+        overlay.transform.center.y = min(max(overlay.transform.center.y + dy, 0), 1)
+        applyLayout(canvasFrame: canvasFrame)
+        delegate?.stickerViewDidCommit(self)
+        // Keep VoiceOver on the sticker as its frame changes.
+        UIAccessibility.post(notification: .layoutChanged, argument: self)
     }
 
     @available(*, unavailable)
