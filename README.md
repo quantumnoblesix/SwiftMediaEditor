@@ -3,8 +3,7 @@
 A native, dependency-free media editor for iOS — edit **photos** and **videos**
 with the same non-destructive engine, usable from both **UIKit** and **SwiftUI**.
 
-> Status: pre-release. Photo and video editing are feature-complete and tested;
-> the first tagged release will be `0.1.0` — see the [changelog](CHANGELOG.md).
+> Current release: **1.0.0**. See the [changelog](CHANGELOG.md) for what's included.
 
 ## Features
 
@@ -164,7 +163,7 @@ see `BrandedToolbar.swift`.
 Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/quantumnoblesix/SwiftMediaEditor.git", from: "0.1.0")
+.package(url: "https://github.com/quantumnoblesix/SwiftMediaEditor.git", from: "1.0.0")
 ```
 
 then add the product to your target — SwiftPM names the package after the
@@ -353,8 +352,8 @@ swift test
 6. ✅ Video crop tool + play/pause transport + audio removal
 7. ✅ Overlays and drawing on video, burned in on export by a Core Image
    video compositor
-8. 🚧 Release — Apache-2.0 license ✅, macOS support ✅, theming + custom-toolbar
-   API ✅, DocC ✅, privacy manifests ✅; tagging `0.1.0` still to come
+8. ✅ Release 1.0.0 — Apache-2.0 license, macOS support, theming and a
+   custom-toolbar API, DocC documentation, privacy manifests
 
 Photos and videos are feature-complete. Video supports the crop tool (aspect
 presets, straighten dial, rotate/flip), drawing, text and stickers, timeline
