@@ -1,0 +1,65 @@
+/* Dismisses without saving */
+"action.cancel" = "Annuler";
+/* Confirms and saves */
+"action.done" = "Terminé";
+/* Applies the current tool's edit */
+"action.apply" = "Appliquer";
+/* Acknowledges an alert */
+"action.ok" = "OK";
+
+/* Title of the crop tool */
+"tool.crop.title" = "Rogner";
+/* Title of the drawing tool */
+"tool.draw.title" = "Dessiner";
+
+/* Unconstrained crop aspect ratio */
+"crop.aspect.free" = "Libre";
+/* The source's own aspect ratio */
+"crop.aspect.original" = "Original";
+
+/* Adds a text overlay */
+"overlay.add.text" = "Texte";
+/* Adds an image overlay */
+"overlay.add.photo" = "Photo";
+
+/* Alert title when export fails */
+"export.failed.title" = "Échec de l’exportation";
+/* Export progress; %d is the percentage. French typography puts a space before % */
+"export.progress" = "Exportation… %d %%";
+
+/* Title of the filters tool */
+"tool.filters.title" = "Filtres";
+/* Filter names */
+"filter.original" = "Original";
+"filter.vivid" = "Éclatant";
+"filter.mono" = "Mono";
+"filter.noir" = "Noir";
+"filter.fade" = "Atténué";
+"filter.chrome" = "Chrome";
+"filter.sepia" = "Sépia";
+"filter.invert" = "Inverser";
+
+/* Video playback + audio */
+/* Starts video playback */
+"action.play" = "Lire";
+/* Pauses video playback */
+"action.pause" = "Pause";
+/* Drops the video's audio track */
+"video.audio.remove" = "Supprimer l’audio";
+/* Brings the video's audio track back */
+"video.audio.restore" = "Rétablir l’audio";
+
+/* Toolbar actions */
+/* Reverts the last edit */
+"action.undo" = "Annuler";
+/* Reapplies a reverted edit */
+"action.redo" = "Rétablir";
+/* Rotates 90 degrees clockwise */
+"tool.rotate" = "Pivoter";
+/* Mirrors left-to-right */
+"tool.flip.horizontal" = "Retourner horizontalement";
+/* Mirrors top-to-bottom */
+"tool.flip.vertical" = "Retourner verticalement";
+
+/* Removes a sticker or text overlay; offered to VoiceOver as an action */
+"action.delete" = "Supprimer";

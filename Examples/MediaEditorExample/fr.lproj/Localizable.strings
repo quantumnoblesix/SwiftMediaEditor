@@ -1,0 +1,35 @@
+"Media Editor" = "Media Editor";
+"Choose media to edit" = "Choisissez un média à modifier";
+"Pick a source to start." = "Choisissez une source pour commencer.";
+"Use Sample Image" = "Utiliser l’image d’exemple";
+"Use Sample Video" = "Utiliser la vidéo d’exemple";
+"Choose from Library" = "Choisir dans la photothèque";
+"Take Photo" = "Prendre une photo";
+"Camera is unavailable on this device." = "L’appareil photo n’est pas disponible sur cet appareil.";
+
+"Choose an editor" = "Choisir un éditeur";
+"Standard Editor" = "Éditeur standard";
+"The full-featured turnkey editor from the package." = "L’éditeur complet et prêt à l’emploi du package.";
+"Custom Editor" = "Éditeur personnalisé";
+"A lightweight editor built on the headless engine." = "Un éditeur léger bâti sur le moteur headless.";
+"Custom editing is available for photos only." = "L’édition personnalisée est disponible pour les photos uniquement.";
+
+"Cancel" = "Annuler";
+"Save" = "Enregistrer";
+"None" = "Aucun";
+"Mono" = "Mono";
+"Sepia" = "Sépia";
+"Invert" = "Inverser";
+"Vibrant" = "Éclatant";
+
+"Result" = "Résultat";
+"Edits: %lld" = "Modifications : %lld";
+"Back to Edit" = "Revenir à l’édition";
+"Start Over" = "Recommencer";
+
+"Custom Options" = "Options personnalisées";
+"Select the tools to enable" = "Sélectionnez les outils à activer";
+"Open Editor" = "Ouvrir l’éditeur";
+"Rotate" = "Pivoter";
+"Flip" = "Retourner";
+"Filters" = "Filtres";
