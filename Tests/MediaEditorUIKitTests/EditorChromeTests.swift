@@ -472,7 +472,8 @@ struct EditorChromeTests {
         #expect(!editor.showsDoneButton)
         #expect(button(labeled: L10n.done, in: editor.view) == nil)
         #expect(bar.superview === editor.view)
-        #expect(abs(bar.frame.maxY - editor.view.safeAreaLayoutGuide.layoutFrame.maxY) < 1)
+        #expect(abs(bar.frame.maxY - editor.view.bounds.maxY) < 1,
+                "the bar runs to the bottom edge; its content keeps clear of the home indicator")
         #expect(bar.frame.width == editor.view.bounds.width)
 
         let preview = try #require(editor.view.subviews.first { $0 is OverlayContainerView })
@@ -523,6 +524,84 @@ struct EditorChromeTests {
             appearance: .messaging, bottomAccessory: bar))
         let filmstrip = try #require(editor.view.subviews.first { $0 is TrimScrubberView })
         #expect(filmstrip.frame.maxY <= bar.frame.minY)
+    }
+
+    @Test("The delete bin clears the accessory and a bottom tool row stacked on it",
+          arguments: [EditorToolbarPlacement.top, .bottom])
+    func binClearsAccessory(placement: EditorToolbarPlacement) throws {
+        var appearance = EditorAppearance.messaging
+        appearance.toolbarPlacement = placement
+        let bar = accessory()
+        let editor = laidOut(MediaEditorViewController(item: .photo(photo()), appearance: appearance,
+                                                       bottomAccessory: bar))
+        let bin = try binPlacement(in: editor)
+        let crop = try #require(button(labeled: L10n.cropTitle, in: editor.view))
+        var lowestObstacle = bar.frame.minY
+        if placement == .bottom {
+            lowestObstacle = min(lowestObstacle, frame(of: crop, in: editor).minY)
+        }
+        #expect(bin.armedBottom <= lowestObstacle)
+    }
+
+    @Test("The delete bin clears the accessory even after its height settles late")
+    func binFollowsLateAccessoryHeight() throws {
+        let bar = UIView()
+        let height = bar.heightAnchor.constraint(equalToConstant: 0)
+        height.isActive = true
+        let editor = laidOut(MediaEditorViewController(item: .photo(photo()), appearance: .messaging,
+                                                       bottomAccessory: bar))
+        // A SwiftUI-hosted bar reports its real size only after the first pass.
+        height.constant = 120
+        editor.view.layoutIfNeeded()
+        let bin = try binPlacement(in: editor)
+        #expect(bin.armedBottom <= bar.frame.minY)
+    }
+
+    @Test("A video's delete bin clears both the accessory and the filmstrip")
+    func videoBinClearsEverything() throws {
+        var appearance = EditorAppearance.messaging
+        appearance.toolbarPlacement = .bottom
+        let bar = accessory()
+        let editor = laidOut(MediaEditorViewController(
+            item: .video(URL(fileURLWithPath: "/tmp/mediaeditor-nonexistent.mov")),
+            appearance: appearance, bottomAccessory: bar))
+        let filmstrip = try #require(editor.view.subviews.first { $0 is TrimScrubberView })
+        let bin = try binPlacement(in: editor)
+        #expect(bin.armedBottom <= filmstrip.frame.minY)
+        #expect(bin.armedBottom <= bar.frame.minY)
+    }
+
+    @Test("The editor stays dark under a light system appearance, accessory included")
+    func editorIsAlwaysDark() {
+        let bar = accessory()
+        let editor = MediaEditorViewController(item: .photo(photo()), bottomAccessory: bar)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        window.overrideUserInterfaceStyle = .light
+        window.rootViewController = editor
+        window.isHidden = false
+        defer { window.isHidden = true }
+        editor.view.layoutIfNeeded()
+
+        #expect(editor.traitCollection.userInterfaceStyle == .dark)
+        #expect(bar.traitCollection.userInterfaceStyle == .dark,
+                "a host's accessory inherits the editor's appearance")
+        #expect(editor.preferredStatusBarStyle == .lightContent)
+    }
+
+    @Test("Undo and redo get circles like the tools under the circular style")
+    func historyButtonsMatchCircularStyle() throws {
+        let editor = laidOut(MediaEditorViewController(item: .photo(photo()), appearance: .messaging))
+        let diameter = EditorAppearance.messaging.circularButtonDiameter
+        let crop = try #require(button(labeled: L10n.cropTitle, in: editor.view))
+        let cancel = try #require(button(labeled: L10n.cancel, in: editor.view))
+        for label in [L10n.undo, L10n.redo] {
+            let history = try #require(button(labeled: label, in: editor.view))
+            let historyFrame = frame(of: history, in: editor)
+            #expect(historyFrame.size == CGSize(width: diameter, height: diameter))
+            #expect(history.currentImage?.symbolConfiguration == crop.currentImage?.symbolConfiguration,
+                    "same glyph point size as the tools")
+            #expect(historyFrame.minY > frame(of: cancel, in: editor).maxY, "still on its own row under Cancel")
+        }
     }
 
     // MARK: - Appearance

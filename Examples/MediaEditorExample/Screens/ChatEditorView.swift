@@ -74,6 +74,5 @@ private struct CaptionComposer: View {
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity)
         .background(.black)
-        .environment(\.colorScheme, .dark)
     }
 }

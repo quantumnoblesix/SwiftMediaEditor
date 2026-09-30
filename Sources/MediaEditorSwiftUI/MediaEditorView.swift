@@ -62,8 +62,10 @@ public struct MediaEditorView<BottomAccessory: View>: UIViewControllerRepresenta
     ///   - onFinish: called with the result when the user saves or cancels. The
     ///     editor never dismisses itself, so end the presentation here.
     ///   - bottomAccessory: a bar pinned full-width under the editor that rides
-    ///     up with the keyboard. It is re-evaluated whenever this view updates,
-    ///     so it can read and bind your state.
+    ///     up with the keyboard. Its content is kept above the home indicator
+    ///     while a `.background` still fills under it, so only add your own
+    ///     padding. It is re-evaluated whenever this view updates, so it can
+    ///     read and bind your state.
     public init(
         item: MediaItem,
         recipe: EditRecipe = .identity,
@@ -88,12 +90,13 @@ public struct MediaEditorView<BottomAccessory: View>: UIViewControllerRepresenta
 
         var accessoryView: UIView?
         if let bottomAccessory {
-            let host = UIHostingController(rootView: bottomAccessory(MediaEditorProxy(coordinator: coordinator)))
+            let host = UIHostingController(rootView: DarkAccessory(content: bottomAccessory(MediaEditorProxy(coordinator: coordinator))))
             host.view.backgroundColor = .clear
-            // Size to the SwiftUI content, and leave the keyboard and safe
-            // areas to the editor, which already pins the bar above both.
+            // Size to the SwiftUI content. The editor pins the bar to the
+            // bottom edge and above the keyboard, so SwiftUI only pads for the
+            // home indicator — backgrounds still run under it.
             host.sizingOptions = .intrinsicContentSize
-            host.safeAreaRegions = []
+            host.safeAreaRegions = .container
             coordinator.accessoryHost = host
             accessoryView = host.view
         }
@@ -120,7 +123,7 @@ public struct MediaEditorView<BottomAccessory: View>: UIViewControllerRepresenta
         let coordinator = context.coordinator
         coordinator.onFinish = onFinish
         if let bottomAccessory, let host = coordinator.accessoryHost {
-            host.rootView = bottomAccessory(MediaEditorProxy(coordinator: coordinator))
+            host.rootView = DarkAccessory(content: bottomAccessory(MediaEditorProxy(coordinator: coordinator)))
         }
     }
 
@@ -130,7 +133,7 @@ public struct MediaEditorView<BottomAccessory: View>: UIViewControllerRepresenta
     public final class Coordinator {
         var onFinish: (EditorResult) -> Void = { _ in }
         fileprivate weak var controller: MediaEditorViewController?
-        fileprivate var accessoryHost: UIHostingController<BottomAccessory>?
+        fileprivate var accessoryHost: UIHostingController<DarkAccessory<BottomAccessory>>?
     }
 }
 
@@ -160,6 +163,18 @@ public extension MediaEditorView where BottomAccessory == EmptyView {
         self.toolbarProvider = toolbarProvider
         self.onFinish = onFinish
         self.bottomAccessory = nil
+    }
+}
+
+/// Pins the accessory to the dark scheme the editor always uses. A hosting
+/// controller nested under a representable takes its environment from the
+/// SwiftUI screen around the editor, not from the editor's UIKit trait
+/// override, so a light-mode app would otherwise get a light caption bar.
+struct DarkAccessory<Content: View>: View {
+    let content: Content
+
+    var body: some View {
+        content.environment(\.colorScheme, .dark)
     }
 }
 

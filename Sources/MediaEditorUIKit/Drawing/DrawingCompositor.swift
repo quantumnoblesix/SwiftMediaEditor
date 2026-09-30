@@ -40,6 +40,27 @@ public struct DrawingCompositor {
         }
     }
 
+    /// `drawing` moved by `map` — source pixels in a `from`-sized output frame
+    /// to source pixels in a `to`-sized one (see `MediaGeometry`) — so the
+    /// strokes stay on the same part of the media across a crop or rotation.
+    ///
+    /// The canvas grows or shrinks with the frame at the drawing's own
+    /// points-per-pixel ratio, so stroke widths keep their size on the media.
+    /// Strokes the new frame leaves out are kept, just off the canvas.
+    func carried(_ drawing: DrawingData, by map: CGAffineTransform,
+                 from: CGSize, to: CGSize) -> DrawingData {
+        guard from.width > 0, drawing.canvasWidth > 0,
+              let pkDrawing = try? PKDrawing(data: drawing.data) else { return drawing }
+        let pointsPerPixel = CGFloat(drawing.canvasWidth) / from.width
+        let inPixels = CGAffineTransform(scaleX: 1 / pointsPerPixel, y: 1 / pointsPerPixel)
+        let toPoints = CGAffineTransform(scaleX: pointsPerPixel, y: pointsPerPixel)
+        let moved = pkDrawing.transformed(using: inPixels.concatenating(map).concatenating(toPoints))
+        return DrawingData(data: moved.dataRepresentation(),
+                           canvasWidth: Double(to.width * pointsPerPixel),
+                           canvasHeight: Double(to.height * pointsPerPixel),
+                           zIndex: drawing.zIndex)
+    }
+
     /// The strokes alone, rasterized for an output `outputSize` pixels across —
     /// draw the result into that rect. `nil` if the drawing is empty or can't be
     /// decoded.

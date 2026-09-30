@@ -64,6 +64,14 @@ struct CoordinatorView: View {
             coordinator.openEditor(.standard)
         } else if args.contains("-MEFlowChat") {
             coordinator.select(.photo(SampleImage.make()))
+            if args.contains("-MESeedStickers") {
+                coordinator.session.recipe = EditRecipe(overlays: [
+                    Overlay(content: .text(TextStyle(string: "AWESOME", fontSizeFraction: 0.12,
+                                                     color: RGBAColor(red: 1, green: 0.8, blue: 0))),
+                            transform: .init(center: .init(x: 0.5, y: 0.4), scale: 1.1, rotation: 0),
+                            zIndex: 0),
+                ])
+            }
             coordinator.openEditor(.chat)
         } else if args.contains("-MEFlowCustom") {
             // Lands on the tool checklist.

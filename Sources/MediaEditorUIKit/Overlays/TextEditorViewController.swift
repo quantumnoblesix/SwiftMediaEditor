@@ -133,6 +133,7 @@ final class TextEditorViewController: UIViewController, UITextViewDelegate {
         picker.selectedColor = style.color.uiColor
         picker.supportsAlpha = true
         picker.delegate = self
+        picker.overrideUserInterfaceStyle = .dark     // match the dark editor
         present(picker, animated: true)
     }
 

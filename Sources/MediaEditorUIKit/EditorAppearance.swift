@@ -28,8 +28,9 @@ public enum EditorToolbarPlacement: Hashable, Sendable {
 public enum EditorToolbarStyle: Hashable, Sendable {
     /// Plain glyphs sharing one floating bar.
     case floatingBar
-    /// Each glyph on its own circular backing, with an ✕ glyph for Cancel — the
-    /// look of a chat app's media editor.
+    /// Each glyph on its own circular backing, with an ✕ glyph for Cancel and
+    /// undo/redo in circles of their own — the look of a chat app's media
+    /// editor.
     case circularButtons
 }
 
@@ -75,7 +76,9 @@ public struct EditorAppearance {
     /// Point size of the tool-row glyphs.
     public var toolSymbolPointSize: CGFloat = 19
     /// Point size of the undo/redo glyphs, which sit on their own smaller pill
-    /// under the top bar rather than in the tool row.
+    /// under the top bar rather than in the tool row. Under
+    /// ``EditorToolbarStyle/circularButtons`` they get a circle each, sized like
+    /// the tool row's, and use ``toolSymbolPointSize`` instead.
     public var historySymbolPointSize: CGFloat = 15
     /// Opt out of Liquid Glass and use the blur material on every OS. Useful
     /// when a host wants one consistent look across iOS versions.
@@ -137,6 +140,10 @@ public struct EditorAppearance {
             let glass = UIGlassEffect(style: .regular)
             glass.isInteractive = true                    // fluid, touch-reactive glass
             let view = UIVisualEffectView(effect: glass)
+            // The editor is always dark, and glass has to be told directly: the
+            // style it inherits isn't applied when a bar is shown again after a
+            // tool, so it comes back light and only darkens a moment later.
+            view.overrideUserInterfaceStyle = .dark
             // Let the glass supply its own continuous-rounded shape rather than
             // clipping to a plain corner radius (keeps the fluid edges).
             view.cornerConfiguration = .corners(radius: .fixed(cornerRadius))
@@ -166,6 +173,7 @@ public struct EditorAppearance {
                 config.baseForegroundColor = colour
             }
             button.configuration = config
+            button.overrideUserInterfaceStyle = .dark   // see `makeBarBackground`
         } else {
             button.setTitle(title, for: .normal)
             button.setTitleColor(colour, for: .normal)

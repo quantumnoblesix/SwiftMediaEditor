@@ -11,12 +11,42 @@ All notable changes to this package are documented here. The format follows
 - `EditorAppearance.toolbarPlacement` (`.top` / `.bottom`) and
   `toolbarStyle` (`.floatingBar` / `.circularButtons`), plus the
   `EditorAppearance.messaging` preset: an ✕ and circular tool buttons across
-  the top, like a chat app's pre-send editor.
+  the top, like a chat app's pre-send editor. Under the circular style undo
+  and redo get matching circles too.
 - A host-supplied bottom accessory — `bottomAccessory:` on
   `MediaEditorViewController`, and a `bottomAccessory` view builder with a
   `MediaEditorProxy` on `MediaEditorView` — for a caption field and send
-  button. It rides up with the keyboard, hides while a tool is open, and
-  replaces the editor's own Done button.
+  button. Like a toolbar, it runs to the bottom edge with its content kept
+  above the home indicator; it rides up with the keyboard, hides while a tool
+  is open, and replaces the editor's own Done button. The sticker delete bin
+  stays clear of it and of a tool row stacked on it.
+
+- `DrawingData.zIndex`, `Overlay.sitsAboveDrawing(at:)`,
+  `EditRecipe.overlayLayers` and `EditRecipe.nextZIndex`: the drawing now
+  stacks among the stickers. New strokes go over the picture stickers already
+  placed, a sticker added afterwards goes over the strokes, and text always
+  stays on top. Preview, photo export and video export all follow it. Recipes
+  saved earlier decode with the drawing under every sticker, as they rendered.
+
+### Changed
+
+- The pencil draws in place among the stickers — over picture stickers, under
+  text — with every other edit still in view.
+- Stickers and the drawing stay on the part of the media they were placed on
+  when it's cropped, rotated or flipped, instead of moving with the frame.
+  Anything a crop cuts away is kept, hidden, and returns if the crop is widened
+  (`MediaGeometry`, `EditRecipe.carryingOverlays(from:sourceSize:)`).
+- The crop tool shows the stickers and drawing on the whole media, dimmed where
+  the crop leaves them out. They fade out while the crop is being adjusted and
+  come back once the change is done. Filters stay visible while cropping.
+- Undo and redo appear once there is something to undo, and hide while a tool
+  is open.
+- Liquid Glass bars no longer come back light for a moment after closing a
+  tool.
+- The editor is always dark, whatever the system appearance — including what
+  it presents (text editor, photo and color pickers, alerts), the PencilKit
+  tool palette, and the host's
+  toolbar and bottom accessory.
 
 ## [1.0.0] - 2026-09-12
 
