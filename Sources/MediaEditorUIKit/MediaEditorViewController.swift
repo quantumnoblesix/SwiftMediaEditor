@@ -117,6 +117,11 @@ public final class MediaEditorViewController: UIViewController {
     /// The drawing `drawingLayerView` shows, so recipe changes that leave the
     /// strokes alone don't re-rasterize them.
     private var renderedDrawing: DrawingData?
+    /// The pixel size `renderedDrawing` was rasterized at.
+    private var renderedDrawingPixels: CGSize = .zero
+    /// The drawing on screen — the recipe's, or in crop mode its whole-frame
+    /// carry.
+    private var shownDrawing: DrawingData?
     private let videoArtworkRenderer = VideoArtworkRenderer()
     /// The video's oriented display size, resolved once the asset loads.
     /// Internal so tests can stand in for a real asset.
@@ -275,6 +280,10 @@ public final class MediaEditorViewController: UIViewController {
         overrideUserInterfaceStyle = .dark
         // The tool palette floats in its own window, out of the override's reach.
         toolPicker.overrideUserInterfaceStyle = .dark
+        // …but its swatches show ink as it will really come out. In dark mode
+        // PencilKit would otherwise adapt them (black shown as white), and the
+        // user would pick a colour the result doesn't have.
+        toolPicker.colorUserInterfaceStyle = .light
         // Restore image-overlay content from a resumed recipe.
         for overlay in recipe.overlays {
             if case let .image(ref) = overlay.content, let data = ref.data,
@@ -324,7 +333,7 @@ public final class MediaEditorViewController: UIViewController {
         // Container shares the image view's frame, so the displayed-image rect
         // (in image-view bounds coordinates) maps directly to container bounds.
         overlayContainer.frame = imageView.frame
-        overlayContainer.imageFrame = overlayCanvasFrame()
+        syncOverlayCanvas()
         if mode == .crop {
             positionCropOverlay()
         }
@@ -575,8 +584,12 @@ public final class MediaEditorViewController: UIViewController {
             accessory.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             accessory.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             accessory.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor),
-            bottomChromeGuide.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            bottomChromeGuide.heightAnchor.constraint(equalTo: accessory.heightAnchor),
+            // The bar's content height, above the safe area: resting, the bar
+            // also covers the home-indicator strip; lifted by the keyboard it
+            // doesn't. Measuring its content keeps the guide — and everything
+            // laid out on it — still while the user types.
+            bottomChromeGuide.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            bottomChromeGuide.heightAnchor.constraint(equalTo: accessory.safeAreaLayoutGuide.heightAnchor),
         ])
     }
 
@@ -755,6 +768,10 @@ public final class MediaEditorViewController: UIViewController {
         canvasView.drawingPolicy = .anyInput          // allow finger drawing (and simulator)
         canvasView.backgroundColor = .clear
         canvasView.isOpaque = false
+        // Strokes are drawn straight onto the media, so show their true colours
+        // rather than PencilKit's dark-mode adaptation — the canvas is clear, so
+        // nothing else about it looks light.
+        canvasView.overrideUserInterfaceStyle = .light
         canvasView.alwaysBounceVertical = false
         canvasView.alwaysBounceHorizontal = false
 
@@ -918,7 +935,7 @@ public final class MediaEditorViewController: UIViewController {
         guard let rendered = renderer.renderGeometry(cgImage: source, recipe: recipe) else { return }
         // The drawing and overlays are live layers on top, not baked in.
         imageView.image = UIImage(cgImage: rendered)
-        overlayContainer.imageFrame = overlayCanvasFrame()
+        syncOverlayCanvas()
     }
 
     /// Where the stickers and the drawing are laid out, in the image view's
@@ -942,15 +959,35 @@ public final class MediaEditorViewController: UIViewController {
     /// export stretches it to the output size.
     private func showDrawing(_ drawing: DrawingData?) {
         overlayContainer.drawingZIndex = drawing?.zIndex ?? .min
-        guard drawing != renderedDrawing else { return }
-        renderedDrawing = drawing
-        guard let drawing else {
+        shownDrawing = drawing
+        rasterizeDrawingIfNeeded()
+    }
+
+    /// Rasterizes the shown drawing at the size it's displayed at — not its
+    /// canvas size, which after a crop can be far smaller (blurry) or, carried
+    /// onto a wider frame, far larger (tens of megabytes) than the screen.
+    private func rasterizeDrawingIfNeeded() {
+        guard let drawing = shownDrawing else {
+            renderedDrawing = nil
             drawingLayerView.image = nil
             return
         }
         let scale = max(1, traitCollection.displayScale)
-        let pixels = CGSize(width: drawing.canvasWidth * scale, height: drawing.canvasHeight * scale)
+        let frame = overlayContainer.imageFrame.size
+        let points = frame.width > 0 && frame.height > 0
+            ? frame : CGSize(width: drawing.canvasWidth, height: drawing.canvasHeight)
+        let pixels = CGSize(width: (points.width * scale).rounded(), height: (points.height * scale).rounded())
+        guard pixels != renderedDrawingPixels || drawing != renderedDrawing else { return }
+        renderedDrawing = drawing
+        renderedDrawingPixels = pixels
         drawingLayerView.image = drawingCompositor.strokeImage(for: drawing, outputSize: pixels)
+    }
+
+    /// Lays the stickers and drawing over the displayed media, re-rasterizing
+    /// the drawing if its on-screen size changed.
+    private func syncOverlayCanvas() {
+        overlayContainer.imageFrame = overlayCanvasFrame()
+        rasterizeDrawingIfNeeded()
     }
 
     /// The rect within `imageView.bounds` where the image is actually displayed
@@ -1168,7 +1205,7 @@ public final class MediaEditorViewController: UIViewController {
         let aw = bbox.width * CGFloat(frac.width)
         let ah = bbox.height * CGFloat(frac.height)
         cropOverlay.allowedRect = CGRect(x: bbox.midX - aw / 2, y: bbox.midY - ah / 2, width: aw, height: ah)
-        overlayContainer.imageFrame = overlayCanvasFrame()
+        syncOverlayCanvas()
     }
 
     /// The user started changing the crop: fade the edits out while the frame
@@ -1199,7 +1236,7 @@ public final class MediaEditorViewController: UIViewController {
         whole.flip = cropFlip
         whole.crop = nil
         let shown = carryingEdits(into: whole, from: recipe)
-        overlayContainer.imageFrame = overlayCanvasFrame()
+        syncOverlayCanvas()
         overlayContainer.reload(overlays: shown.overlays, images: overlayImages)
         showDrawing(shown.drawing)
     }
@@ -1235,15 +1272,26 @@ public final class MediaEditorViewController: UIViewController {
 
     @objc private func applyCropTapped() {
         var next = recipe
-        next.rotation = RotationState(degrees: cropTotalDegrees)
+        // Four quarter turns are no turn at all, not a 360° edit.
+        next.rotation = RotationState(degrees: cropTotalDegrees.truncatingRemainder(dividingBy: 360))
         next.flip = cropFlip
         if cropOverlay.isEffectivelyFull {
             next.crop = nil
         } else {
-            next.crop = CropState(rect: cropOverlay.normalizedCropRect(), aspect: cropOverlay.aspect)
+            let rect = cropOverlay.normalizedCropRect()
+            // Opening crop and applying straight away round-trips the rect
+            // through screen points; keep the recipe's own rather than record
+            // floating-point noise as an edit (and move every sticker for it).
+            if let current = recipe.crop, current.aspect == cropOverlay.aspect,
+               current.rect.isClose(to: rect) {
+                next.crop = current
+            } else {
+                next.crop = CropState(rect: rect, aspect: cropOverlay.aspect)
+            }
         }
         let changed = next.rendersDifferently(from: recipe)
-        exitCropMode()
+        // `applyGeometry` lays the edits out for the new recipe itself.
+        exitCropMode(restoringEdits: false)
         applyGeometry(next)
         // An unchanged recipe doesn't re-render, and the preview still shows
         // the whole uncropped frame from crop mode.
@@ -1283,7 +1331,9 @@ public final class MediaEditorViewController: UIViewController {
         }
     }
 
-    private func exitCropMode() {
+    /// Leaves crop mode. `restoringEdits` puts the recipe's own sticker and
+    /// drawing layout back; Apply skips it, since it lays them out anew.
+    private func exitCropMode(restoringEdits: Bool = true) {
         mode = .normal
         cropOverlay.removeFromSuperview()
         if case .video = item {
@@ -1297,9 +1347,11 @@ public final class MediaEditorViewController: UIViewController {
         overlayContainer.isUserInteractionEnabled = true
         overlayContainer.clipsToCanvas = true
         // Back to the recipe's own layout of the edits.
-        overlayContainer.imageFrame = overlayCanvasFrame()
-        reloadOverlaysFromRecipe()
-        updateDrawingLayer()
+        syncOverlayCanvas()
+        if restoringEdits {
+            reloadOverlaysFromRecipe()
+            updateDrawingLayer()
+        }
         topBar.isHidden = false
         setMainToolbarHidden(false)
         cropTopBar.isHidden = true
@@ -1598,7 +1650,7 @@ public final class MediaEditorViewController: UIViewController {
         CATransaction.commit()
 
         alignTransport(to: display)
-        overlayContainer.imageFrame = overlayCanvasFrame()
+        syncOverlayCanvas()
     }
 
     private func seek(to seconds: Double) {
@@ -1874,7 +1926,11 @@ public final class MediaEditorViewController: UIViewController {
     }
 
     private func presentTextEditor(seed: TextStyle, completion: @escaping (TextStyle) -> Void) {
-        let editor = TextEditorViewController(style: seed, appearance: appearance) { style in
+        // The text editor brings up the keyboard, which would lift the caption
+        // bar into view behind its translucent backdrop.
+        bottomAccessory?.isHidden = true
+        let editor = TextEditorViewController(style: seed, appearance: appearance) { [weak self] style in
+            if let self, mode == .normal { bottomAccessory?.isHidden = false }
             guard let style else { return }
             completion(style)
         }
@@ -2083,6 +2139,29 @@ public final class MediaEditorViewController: UIViewController {
     /// Photos render synchronously through `PhotoRenderer`. Videos export
     /// asynchronously through `VideoComposer` behind a progress panel, with the
     /// drawing and overlays burned in; `onFinish` fires once the file is ready.
+    /// Stacks the edits onto the rendered photo as on screen — the stickers
+    /// under the strokes, the strokes, then the stickers over them — in a
+    /// single full-resolution pass, so a large photo needs one output bitmap
+    /// and one for the strokes rather than one per layer.
+    private func composite(base: UIImage) -> UIImage {
+        guard !recipe.overlays.isEmpty || recipe.drawing != nil else { return base }
+        let canvas = base.size
+        let pixels = CGSize(width: canvas.width * base.scale, height: canvas.height * base.scale)
+        let strokes = recipe.drawing.flatMap { drawingCompositor.strokeImage(for: $0, outputSize: pixels) }
+        let layers = recipe.overlayLayers
+
+        let format = UIGraphicsImageRendererFormat.preferred()
+        format.scale = base.scale
+        format.opaque = false
+        let bounds = CGRect(origin: .zero, size: canvas)
+        return UIGraphicsImageRenderer(size: canvas, format: format).image { context in
+            base.draw(in: bounds)
+            overlayCompositor.draw(layers.belowDrawing, in: context.cgContext, canvas: canvas, images: overlayImages)
+            strokes?.draw(in: bounds)
+            overlayCompositor.draw(layers.aboveDrawing, in: context.cgContext, canvas: canvas, images: overlayImages)
+        }
+    }
+
     public func finish() {
         switch item {
         case .photo:
@@ -2091,15 +2170,7 @@ public final class MediaEditorViewController: UIViewController {
                 onFinish?(.cancelled)
                 return
             }
-            // Stacked as on screen: the stickers under the strokes, the
-            // strokes, then the stickers over them.
-            let layers = recipe.overlayLayers
-            var output = overlayCompositor.composite(base: UIImage(cgImage: rendered),
-                                                     overlays: layers.belowDrawing, images: overlayImages)
-            if let drawing = recipe.drawing {
-                output = drawingCompositor.composite(base: output, drawing: drawing)
-            }
-            output = overlayCompositor.composite(base: output, overlays: layers.aboveDrawing, images: overlayImages)
+            let output = composite(base: UIImage(cgImage: rendered))
             onFinish?(.saved(output: .photo(output), recipe: recipe))
         case .video:
             exportVideo()
@@ -2111,6 +2182,9 @@ public final class MediaEditorViewController: UIViewController {
 
 extension MediaEditorViewController: OverlayContainerDelegate {
     func overlayContainerDidCommit(_ container: OverlayContainerView) {
+        // In crop mode the container shows the edits carried onto the whole
+        // frame; a gesture that began before must not write those back.
+        guard mode != .crop else { return }
         var next = recipe
         next.overlays = container.currentOverlays()
         apply(next)

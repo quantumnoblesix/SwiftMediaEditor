@@ -187,4 +187,15 @@ public struct DrawingData: Codable, Equatable, Sendable {
         canvasHeight = try c.decode(Double.self, forKey: .canvasHeight)
         zIndex = try c.decodeIfPresent(Int.self, forKey: .zIndex) ?? .min
     }
+
+    /// Leaves `zIndex` out while it's the legacy default, so recipes without a
+    /// stacking position encode exactly as they did — and never carry `Int.min`
+    /// into JSON consumers that read numbers as doubles.
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(data, forKey: .data)
+        try c.encode(canvasWidth, forKey: .canvasWidth)
+        try c.encode(canvasHeight, forKey: .canvasHeight)
+        if zIndex != .min { try c.encode(zIndex, forKey: .zIndex) }
+    }
 }

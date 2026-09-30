@@ -95,4 +95,12 @@ struct MediaGeometryTests {
                     && near(sin(a.transform.rotation), sin(b.transform.rotation)))
         }
     }
+
+    @Test("A drawing without a stacking position encodes as it always did")
+    func legacyDrawingEncoding() throws {
+        let legacy = try JSONEncoder().encode(DrawingData(data: Data([1]), canvasWidth: 1, canvasHeight: 1))
+        #expect(!String(decoding: legacy, as: UTF8.self).contains("zIndex"))
+        let stacked = try JSONEncoder().encode(DrawingData(data: Data([1]), canvasWidth: 1, canvasHeight: 1, zIndex: 4))
+        #expect(try JSONDecoder().decode(DrawingData.self, from: stacked).zIndex == 4)
+    }
 }

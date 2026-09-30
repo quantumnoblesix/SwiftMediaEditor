@@ -71,7 +71,14 @@ public struct DrawingCompositor {
             return nil
         }
         let authoringRect = CGRect(x: 0, y: 0, width: drawing.canvasWidth, height: drawing.canvasHeight)
-        return pkDrawing.image(from: authoringRect, scale: outputSize.width / CGFloat(drawing.canvasWidth))
+        // `image(from:scale:)` adapts ink to the current trait collection, and the
+        // editor is dark: render in light so the strokes keep the colours they
+        // were drawn with, on screen and in the export alike.
+        var image: UIImage?
+        UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
+            image = pkDrawing.image(from: authoringRect, scale: outputSize.width / CGFloat(drawing.canvasWidth))
+        }
+        return image
     }
 }
 

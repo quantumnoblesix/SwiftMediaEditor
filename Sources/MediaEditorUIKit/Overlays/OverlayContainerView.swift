@@ -47,34 +47,40 @@ final class OverlayContainerView: UIView {
     var imageFrame: CGRect = .zero {
         didSet {
             guard imageFrame != oldValue else { return }
+            // The layer's bounds start where its frame does, so everything in it
+            // keeps using this view's coordinates.
+            canvasLayer.frame = imageFrame
+            canvasLayer.bounds.origin = imageFrame.origin
             stickers.forEach { $0.applyLayout(canvasFrame: imageFrame) }
             drawingView.frame = imageFrame
             drawingCanvas?.frame = imageFrame
-            updateCanvasMask()
         }
     }
 
-    /// Hide what lies outside `imageFrame`: a sticker the crop has cut away
-    /// stays in the recipe — widen the crop and it's back — but shouldn't float
-    /// over the letterboxing. Relaxed while a sticker is dragged, so it stays in
-    /// view on its way to the delete bin.
+    /// Holds the stickers and the drawing over `imageFrame`, and clips them to
+    /// it: a sticker the crop has cut away stays in the recipe — widen the crop
+    /// and it's back — but shouldn't float over the letterboxing. A plain
+    /// rectangular clip rather than a mask, which would cost an offscreen pass
+    /// every frame over a playing video.
+    ///
+    /// Touches outside `imageFrame` never reach a sticker, but still land on
+    /// this view, so taps and pinches in the letterboxing keep working.
+    private let canvasLayer = UIView()
+
+    /// Whether to clip to `imageFrame`. Relaxed while a sticker is dragged, so
+    /// it stays in view on its way to the delete bin.
     var clipsToCanvas = true {
-        didSet { updateCanvasMask() }
+        didSet { updateCanvasClip() }
     }
-    private let canvasMask: UIView = {
-        let view = UIView()
-        view.backgroundColor = .black
-        return view
-    }()
 
-    private func updateCanvasMask() {
-        canvasMask.frame = imageFrame
-        let clip = clipsToCanvas && draggedSticker == nil && !imageFrame.isEmpty
-        if clip, mask !== canvasMask {
-            mask = canvasMask
-        } else if !clip, mask != nil {
-            mask = nil
-        }
+    /// Whether the stickers are clipped to the media right now.
+    var isClippingToCanvas: Bool { canvasLayer.clipsToBounds }
+
+    /// The stickers and the drawing, bottom to top — for tests.
+    var layeredViews: [UIView] { canvasLayer.subviews }
+
+    private func updateCanvasClip() {
+        canvasLayer.clipsToBounds = clipsToCanvas && draggedSticker == nil
     }
 
     private var stickers: [StickerView] = []
@@ -121,7 +127,9 @@ final class OverlayContainerView: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
-        addSubview(drawingView)
+        canvasLayer.clipsToBounds = true
+        addSubview(canvasLayer)
+        canvasLayer.addSubview(drawingView)
         let tap = UITapGestureRecognizer(target: self, action: #selector(backgroundTapped))
         tap.cancelsTouchesInView = false
         addGestureRecognizer(tap)
@@ -142,10 +150,8 @@ final class OverlayContainerView: UIView {
     // Only intercept touches that land on a sticker; let the rest pass through
     // (except the background tap above, which deselects).
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        // Clipped-away parts of stickers can't be seen, so they can't be grabbed.
-        if mask != nil, !imageFrame.contains(point) { return nil }
         let hit = super.hitTest(point, with: event)
-        return hit === self ? self : hit
+        return hit === canvasLayer ? self : hit
     }
 
     // MARK: - Building
@@ -162,7 +168,7 @@ final class OverlayContainerView: UIView {
             }()
             let sticker = StickerView(overlay: overlay, image: image)
             sticker.delegate = self
-            addSubview(sticker)
+            canvasLayer.addSubview(sticker)
             sticker.applyLayout(canvasFrame: imageFrame)
             return sticker
         }
@@ -188,7 +194,7 @@ final class OverlayContainerView: UIView {
         let above = stickers.filter { $0.overlay.sitsAboveDrawing(at: z) }
         let drawingLayer: UIView = drawingCanvas ?? drawingView
         for view in ordered(below) + [drawingLayer] + ordered(above) {
-            bringSubviewToFront(view)
+            canvasLayer.bringSubviewToFront(view)
         }
         if let trashView { bringSubviewToFront(trashView) }
     }
@@ -203,7 +209,7 @@ final class OverlayContainerView: UIView {
         deselect()
         drawingCanvas = canvas
         canvas.frame = imageFrame
-        addSubview(canvas)
+        canvasLayer.addSubview(canvas)
         drawingView.isHidden = true            // the canvas shows the strokes itself
         stickers.forEach { $0.isUserInteractionEnabled = false }
         gestureRecognizers?.forEach { $0.isEnabled = false }
@@ -358,7 +364,7 @@ extension OverlayContainerView: StickerViewDelegate {
         let bin = trash()
         if draggedSticker !== sticker {
             draggedSticker = sticker
-            updateCanvasMask()
+            updateCanvasClip()
             bin.center = trashCenter
             // Above the stickers, including the one being dragged, so the bin
             // stays visible under a large sticker.
@@ -386,7 +392,7 @@ extension OverlayContainerView: StickerViewDelegate {
         // Clip again once the bin — and a sticker dropped into it — have gone:
         // both animate outside the canvas.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.updateCanvasMask()
+            self?.updateCanvasClip()
         }
         isTrashArmed = false
         if wasDragging { delegate?.overlayContainer(self, isDraggingSticker: false) }

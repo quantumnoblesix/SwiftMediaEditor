@@ -91,7 +91,7 @@ struct EditLayeringTests {
     }
 
     private func stackIndex(of content: (OverlayContent) -> Bool, in container: OverlayContainerView) throws -> Int {
-        try #require(container.subviews.firstIndex { ($0 as? StickerView).map { content($0.overlay.content) } ?? false })
+        try #require(container.layeredViews.firstIndex { ($0 as? StickerView).map { content($0.overlay.content) } ?? false })
     }
 
     private func isPicture(_ content: OverlayContent) -> Bool {
@@ -181,11 +181,11 @@ struct EditLayeringTests {
         let stickers = try container(of: editor)
         editor.enterDrawingMode()
 
-        let canvas = try #require(stickers.subviews.firstIndex { $0 is PKCanvasView })
+        let canvas = try #require(stickers.layeredViews.firstIndex { $0 is PKCanvasView })
         #expect(try stackIndex(of: isPicture, in: stickers) < canvas)
         #expect(try stackIndex(of: isText, in: stickers) > canvas)
         #expect(!stickers.isHidden)
-        #expect(stickers.subviews.compactMap { $0 as? StickerView }.allSatisfy { !$0.isUserInteractionEnabled },
+        #expect(stickers.layeredViews.compactMap { $0 as? StickerView }.allSatisfy { !$0.isUserInteractionEnabled },
                 "a text sticker over the canvas mustn't swallow strokes")
     }
 
@@ -194,7 +194,7 @@ struct EditLayeringTests {
         let editor = laidOut(MediaEditorViewController(
             item: .photo(photo()), recipe: EditRecipe(overlays: [picture(zIndex: 0), caption(zIndex: 1)])))
         editor.enterDrawingMode()
-        let canvas = try #require(try container(of: editor).subviews.first { $0 is PKCanvasView } as? PKCanvasView)
+        let canvas = try #require(try container(of: editor).layeredViews.first { $0 is PKCanvasView } as? PKCanvasView)
         canvas.drawing = middleStroke(in: canvas.bounds.size)
         tap(try #require(visibleButton(titled: L10n.done, in: editor.view)))
 
@@ -229,7 +229,7 @@ struct EditLayeringTests {
 
         #expect(!stickers.isHidden && stickers.alpha == 1)
         #expect(!stickers.isUserInteractionEnabled, "they're for looking at, not editing")
-        #expect(stickers.mask == nil, "the crop overlay's dimming shows what's cut, so nothing is clipped")
+        #expect(!stickers.isClippingToCanvas, "the crop overlay's dimming shows what's cut, so nothing is clipped")
         // Centred in the kept quarter, which is the whole frame's bottom-right.
         let shown = try #require(stickers.currentOverlays().first)
         #expect(near(shown.transform.center.x, 0.75) && near(shown.transform.center.y, 0.75))
@@ -279,8 +279,79 @@ struct EditLayeringTests {
     func clippedToTheMedia() throws {
         let editor = laidOut(MediaEditorViewController(item: .photo(photo())))
         let stickers = try container(of: editor)
-        #expect(stickers.mask != nil)
-        #expect(stickers.mask?.frame == stickers.imageFrame)
+        #expect(stickers.isClippingToCanvas)
+        // A tap in the letterboxing still reaches the container, for deselecting
+        // and pinching, but never a sticker.
+        let outside = CGPoint(x: stickers.imageFrame.midX, y: stickers.imageFrame.minY - 5)
+        if stickers.bounds.contains(outside) {
+            #expect(stickers.hitTest(outside, with: nil) === stickers)
+        }
+    }
+
+    // MARK: - Review fixes
+
+    @Test("Opening crop and applying without a change records nothing and leaves the edits alone")
+    func applyingUnchangedCropIsNoEdit() throws {
+        let strokes = DrawingData(data: middleStroke(in: CGSize(width: 200, height: 150)).dataRepresentation(),
+                                  canvasWidth: 200, canvasHeight: 150, zIndex: 3)
+        let recipe = EditRecipe(crop: CropState(rect: NormalizedRect(x: 0.1, y: 0.2, width: 0.55, height: 0.5)),
+                                drawing: strokes, overlays: [caption(zIndex: 0)])
+        let editor = laidOut(MediaEditorViewController(item: .photo(photo()), recipe: recipe))
+        editor.enterCropMode()
+        tap(try #require(visibleButton(titled: L10n.apply, in: editor.view)))
+        #expect(!editor.canUndo, "nothing changed, so there is nothing to undo")
+        #expect(editor.recipe == recipe)
+    }
+
+    @Test("Four quarter turns in crop are no turn at all")
+    func fullTurnIsNoRotation() throws {
+        let editor = laidOut(MediaEditorViewController(item: .photo(photo())))
+        editor.enterCropMode()
+        let rotate = try #require(visibleButton(titled: L10n.rotate, in: editor.view))
+        for _ in 0..<4 { tap(rotate) }
+        tap(try #require(visibleButton(titled: L10n.apply, in: editor.view)))
+        #expect(editor.recipe.rotation.degrees == 0)
+        #expect(!editor.canUndo)
+    }
+
+    @Test("The drawing is rasterized at its on-screen size, whatever its canvas size")
+    func drawingRasterMatchesScreen() throws {
+        // Authored on a canvas a tenth of the displayed size, as after a zoom crop.
+        let small = DrawingData(data: middleStroke(in: CGSize(width: 36, height: 27)).dataRepresentation(),
+                                canvasWidth: 36, canvasHeight: 27)
+        let editor = laidOut(MediaEditorViewController(item: .photo(photo()), recipe: EditRecipe(drawing: small)))
+        let shown = try container(of: editor).imageFrame.size
+        let raster = try #require(editor.drawingLayerView.image)
+        #expect(abs(raster.size.width * raster.scale - shown.width * editor.traitCollection.displayScale) <= 1,
+                "sharp at the size it's shown, not stretched from the canvas")
+    }
+
+    @Test("Adding strokes doesn't re-render the photo underneath")
+    func strokesSkipTheRender() {
+        let strokes = DrawingData(data: Data([1, 2, 3]), canvasWidth: 10, canvasHeight: 10)
+        #expect(!EditRecipe(drawing: strokes).rendersDifferently(from: EditRecipe()))
+    }
+
+    @Test("Strokes keep the colour they were drawn in, even rendered under dark mode")
+    func inkIsNotAdaptedForDarkMode() throws {
+        let size = CGSize(width: 400, height: 300)
+        let black = DrawingData(data: middleStroke(in: size, color: .black).dataRepresentation(),
+                                canvasWidth: 400, canvasHeight: 300)
+        var raster: UIImage?
+        UITraitCollection(userInterfaceStyle: .dark).performAsCurrent {
+            raster = DrawingCompositor().strokeImage(for: black, outputSize: size)
+        }
+        let ink = rgb(of: try #require(raster?.cgImage), at: CGPoint(x: 200, y: 150))
+        #expect(ink.r < 40 && ink.g < 40 && ink.b < 40, "black ink stays black, not dark mode's white")
+    }
+
+    @Test("The pencil canvas shows ink in its true colours inside the dark editor")
+    func canvasShowsTrueColours() throws {
+        let editor = laidOut(MediaEditorViewController(item: .photo(photo())))
+        editor.enterDrawingMode()
+        let canvas = try #require(try container(of: editor).layeredViews.first { $0 is PKCanvasView })
+        #expect(canvas.traitCollection.userInterfaceStyle == .light)
+        #expect(editor.traitCollection.userInterfaceStyle == .dark)
     }
 
     // MARK: - Undo / redo

@@ -41,6 +41,14 @@ All notable changes to this package are documented here. The format follows
   come back once the change is done. Filters stay visible while cropping.
 - Undo and redo appear once there is something to undo, and hide while a tool
   is open.
+- `EditRecipe.rendersDifferently(from:)` no longer counts the drawing, which
+  is now a live layer over the render rather than part of it.
+- `MediaEditorView` is generic over its bottom accessory. Call sites compile
+  unchanged; code that names the type explicitly should use
+  `MediaEditorView<EmptyView>`.
+- Pencil ink keeps its true colours in the always-dark editor — on the canvas,
+  in the tool palette's swatches and in the result — instead of PencilKit's
+  dark-mode adaptation, which showed black ink as white while drawing.
 - Liquid Glass bars no longer come back light for a moment after closing a
   tool.
 - The editor is always dark, whatever the system appearance — including what
