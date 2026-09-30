@@ -6,6 +6,18 @@ All notable changes to this package are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `EditorAppearance.toolbarPlacement` (`.top` / `.bottom`) and
+  `toolbarStyle` (`.floatingBar` / `.circularButtons`), plus the
+  `EditorAppearance.messaging` preset: an ✕ and circular tool buttons across
+  the top, like a chat app's pre-send editor.
+- A host-supplied bottom accessory — `bottomAccessory:` on
+  `MediaEditorViewController`, and a `bottomAccessory` view builder with a
+  `MediaEditorProxy` on `MediaEditorView` — for a caption field and send
+  button. It rides up with the keyboard, hides while a tool is open, and
+  replaces the editor's own Done button.
+
 ## [1.0.0] - 2026-09-12
 
 The first public release.

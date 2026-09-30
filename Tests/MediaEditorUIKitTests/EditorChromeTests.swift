@@ -423,6 +423,108 @@ struct EditorChromeTests {
         #expect(filmstrip.frame.minY - bin.armedBottom < 40)
     }
 
+    // MARK: - Toolbar placement and bottom accessory
+
+    /// Windows keeping the laid-out editors on screen for the test's duration.
+    private static var windows: [UIWindow] = []
+
+    /// A laid-out editor at phone size. It goes in a window: the keyboard layout
+    /// guide the accessory hangs from only resolves inside one.
+    private func laidOut(_ editor: MediaEditorViewController) -> MediaEditorViewController {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        window.rootViewController = editor
+        window.isHidden = false
+        Self.windows.append(window)
+        editor.view.layoutIfNeeded()
+        return editor
+    }
+
+    /// A fixed-height stand-in for a host's caption bar.
+    private func accessory(height: CGFloat = 64) -> UIView {
+        let view = UIView()
+        view.heightAnchor.constraint(equalToConstant: height).isActive = true
+        return view
+    }
+
+    private func frame(of view: UIView, in editor: MediaEditorViewController) -> CGRect {
+        editor.view.convert(view.bounds, from: view)
+    }
+
+    @Test("The messaging layout puts the tools in the top bar, above the preview")
+    func topPlacementMovesToolsUp() throws {
+        let editor = laidOut(MediaEditorViewController(item: .photo(photo()), appearance: .messaging))
+        let crop = try #require(button(labeled: L10n.cropTitle, in: editor.view))
+        let cancel = try #require(button(labeled: L10n.cancel, in: editor.view))
+        let preview = try #require(editor.view.subviews.first { $0 is OverlayContainerView })
+
+        #expect(frame(of: crop, in: editor).maxY <= preview.frame.minY)
+        #expect(abs(frame(of: crop, in: editor).midY - frame(of: cancel, in: editor).midY) < 1,
+                "the tools share the close button's row")
+        #expect(frame(of: crop, in: editor).width == EditorAppearance.messaging.circularButtonDiameter,
+                "each tool fills its circular backing")
+    }
+
+    @Test("An accessory sits at the bottom and replaces the Done button")
+    func accessoryReplacesDone() throws {
+        let bar = accessory()
+        let editor = laidOut(MediaEditorViewController(item: .photo(photo()), appearance: .messaging,
+                                                       bottomAccessory: bar))
+        #expect(!editor.showsDoneButton)
+        #expect(button(labeled: L10n.done, in: editor.view) == nil)
+        #expect(bar.superview === editor.view)
+        #expect(abs(bar.frame.maxY - editor.view.safeAreaLayoutGuide.layoutFrame.maxY) < 1)
+        #expect(bar.frame.width == editor.view.bounds.width)
+
+        let preview = try #require(editor.view.subviews.first { $0 is OverlayContainerView })
+        #expect(preview.frame.maxY <= bar.frame.minY, "the preview stops above the accessory")
+        #expect(editor.view.subviews.last === bar, "the keyboard lifts the accessory over the preview")
+    }
+
+    @Test("Without an accessory, the top layout keeps a Done button at the bottom")
+    func topPlacementKeepsDone() throws {
+        let editor = laidOut(MediaEditorViewController(item: .photo(photo()), appearance: .messaging))
+        #expect(editor.showsDoneButton)
+        let done = try #require(editor.view.subviews.compactMap { $0 as? UIButton }.first)
+        let preview = try #require(editor.view.subviews.first { $0 is OverlayContainerView })
+        #expect(done.frame.minY >= preview.frame.maxY)
+        #expect(done.frame.maxX > editor.view.bounds.midX, "Done sits in the trailing corner")
+    }
+
+    @Test("A bottom tool row stacks directly on top of the accessory")
+    func bottomPlacementSitsOnAccessory() throws {
+        var appearance = EditorAppearance()
+        appearance.toolbarStyle = .circularButtons
+        let bar = accessory()
+        let editor = laidOut(MediaEditorViewController(item: .photo(photo()), appearance: appearance,
+                                                       bottomAccessory: bar))
+        let crop = try #require(button(labeled: L10n.cropTitle, in: editor.view))
+        let cropFrame = frame(of: crop, in: editor)
+        #expect(cropFrame.maxY <= bar.frame.minY)
+        #expect(bar.frame.minY - cropFrame.maxY < 20)
+    }
+
+    @Test("The accessory steps aside while a tool is open")
+    func accessoryHidesInToolMode() {
+        let bar = accessory()
+        let editor = laidOut(MediaEditorViewController(item: .photo(photo()), bottomAccessory: bar))
+        editor.enterCropMode()
+        #expect(bar.isHidden)
+        editor.perform(.cancel)
+        let again = laidOut(MediaEditorViewController(item: .photo(photo()), bottomAccessory: accessory()))
+        again.enterFilterMode()
+        #expect(again.bottomAccessory?.isHidden == true)
+    }
+
+    @Test("A video's filmstrip stacks above the accessory")
+    func filmstripSitsAboveAccessory() throws {
+        let bar = accessory()
+        let editor = laidOut(MediaEditorViewController(
+            item: .video(URL(fileURLWithPath: "/tmp/mediaeditor-nonexistent.mov")),
+            appearance: .messaging, bottomAccessory: bar))
+        let filmstrip = try #require(editor.view.subviews.first { $0 is TrimScrubberView })
+        #expect(filmstrip.frame.maxY <= bar.frame.minY)
+    }
+
     // MARK: - Appearance
 
     @Test("Appearance overrides the glyph for an action")

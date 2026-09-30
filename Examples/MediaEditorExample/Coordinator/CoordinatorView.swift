@@ -29,6 +29,8 @@ struct CoordinatorView: View {
                         StandardEditorView(source: source, initialRecipe: session.recipe)
                     case .brandedEditor:
                         BrandedEditorView(source: source, initialRecipe: session.recipe)
+                    case .chatEditor:
+                        ChatEditorView(source: source, initialRecipe: session.recipe)
                     case .customOptions:
                         CustomOptionsView()
                     case .customEditor:
@@ -60,6 +62,9 @@ struct CoordinatorView: View {
                 ])
             }
             coordinator.openEditor(.standard)
+        } else if args.contains("-MEFlowChat") {
+            coordinator.select(.photo(SampleImage.make()))
+            coordinator.openEditor(.chat)
         } else if args.contains("-MEFlowCustom") {
             // Lands on the tool checklist.
             coordinator.select(.photo(SampleImage.make()))

@@ -46,6 +46,16 @@ public final class MediaEditorViewController: UIViewController {
     /// `perform(_:)`. See ``MediaEditorToolbarProviding``.
     public private(set) weak var toolbarProvider: (any MediaEditorToolbarProviding)?
 
+    /// A host-supplied bar pinned under everything else — a caption field and a
+    /// send button, say. It spans the full width, sizes itself, and rides up
+    /// with the keyboard. See ``init(item:recipe:configuration:appearance:toolbarProvider:bottomAccessory:onFinish:)``.
+    public let bottomAccessory: UIView?
+
+    /// Whether the editor draws its own Done button. A bottom accessory takes
+    /// that job over — its send button calls `finish()` — so the editor drops
+    /// its own rather than offering two ways to confirm.
+    public var showsDoneButton: Bool { bottomAccessory == nil }
+
     /// Undo/redo history over the working recipe.
     private var history: EditHistory<EditRecipe>
 
@@ -146,11 +156,21 @@ public final class MediaEditorViewController: UIViewController {
     private let topBar = UIStackView()
     private let historyBar = UIStackView()
     private lazy var historyBarBackground = appearance.makeBarBackground(cornerRadius: 13)
-    private let bottomToolbar = UIStackView()
-    
-    private lazy var bottomToolbarBackground = appearance.makeBarBackground(cornerRadius: appearance.toolbarCornerRadius)
+    /// The built-in tool buttons, laid out in a row.
+    private let toolRow = UIStackView()
+    private lazy var toolRowBackground = appearance.makeBarBackground(cornerRadius: appearance.toolbarCornerRadius)
     /// A host-supplied tool row, when `toolbarProvider` returned one.
     private var customToolbar: UIView?
+    /// Whatever went into the layout for the tool row — the custom row, the
+    /// glass bar, or the bare row of circular buttons.
+    private var toolRowContainer: UIView?
+    /// The Done button, when `toolbarPlacement` is `.top` and pushes it down to
+    /// the bottom trailing corner.
+    private var floatingDoneButton: UIButton?
+    /// Reserves the accessory's resting height above the bottom safe area. The
+    /// accessory itself follows the keyboard; the preview and video controls
+    /// lay out against this instead, so they stay put while the user types.
+    private let bottomChromeGuide = UILayoutGuide()
 
     // Overlay (sticker) layer, above the image preview.
     private let overlayContainer = OverlayContainerView()
@@ -187,6 +207,9 @@ public final class MediaEditorViewController: UIViewController {
     private lazy var redoButton = makeToolButton(.redo, selector: #selector(redoTapped),
                                                  pointSize: appearance.historySymbolPointSize)
     private lazy var audioButton = makeToolButton(.toggleAudio, selector: #selector(toggleAudioTapped))
+    /// What to hide to take the audio toggle out of the row — its circular
+    /// backing under that style, otherwise the button itself.
+    private var audioButtonHost: UIView?
 
     // MARK: - Init
 
@@ -197,6 +220,12 @@ public final class MediaEditorViewController: UIViewController {
     ///   - appearance: how the built-in chrome is styled.
     ///   - toolbarProvider: supplies a replacement tool row, or `nil` for the
     ///     built-in one. Held weakly — keep your own reference to it.
+    ///   - bottomAccessory: a bar the host owns, pinned full-width to the
+    ///     bottom and lifted by the keyboard — typically a caption field and a
+    ///     send button. Give it an intrinsic height or its own constraints, and
+    ///     call `finish()` from its send action: with an accessory installed the
+    ///     editor shows no Done button of its own. It is hidden while a tool
+    ///     (crop, drawing, filters) is open.
     ///   - onFinish: completion handler delivering the result.
     public init(
         item: MediaItem,
@@ -204,12 +233,14 @@ public final class MediaEditorViewController: UIViewController {
         configuration: EditorConfiguration = .default,
         appearance: EditorAppearance = .default,
         toolbarProvider: (any MediaEditorToolbarProviding)? = nil,
+        bottomAccessory: UIView? = nil,
         onFinish: ((EditorResult) -> Void)? = nil
     ) {
         self.item = item
         self.configuration = configuration
         self.appearance = appearance
         self.toolbarProvider = toolbarProvider
+        self.bottomAccessory = bottomAccessory
         self.recipe = recipe
         self.history = EditHistory(initial: recipe, limit: configuration.historyLimit)
         if case let .photo(image) = item {
@@ -307,7 +338,7 @@ public final class MediaEditorViewController: UIViewController {
             imageView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
             imageView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
             imageView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 56),
-            imageView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -88),
+            previewBottomConstraint(),
         ])
 
         // Sticker layer floats over the image; positioned in layout passes.
@@ -321,17 +352,41 @@ public final class MediaEditorViewController: UIViewController {
         }
     }
 
+    /// Where the preview stops. Under a bottom tool row it leaves the row's
+    /// height plus breathing room; with the row at the top it only has to clear
+    /// the floating Done button or the accessory.
+    private func previewBottomConstraint() -> NSLayoutConstraint {
+        switch appearance.toolbarPlacement {
+        case .bottom:
+            return imageView.bottomAnchor.constraint(equalTo: bottomChromeGuide.topAnchor, constant: -88)
+        case .top:
+            let anchor = floatingDoneButton?.topAnchor ?? bottomChromeGuide.topAnchor
+            return imageView.bottomAnchor.constraint(equalTo: anchor, constant: -16)
+        }
+    }
+
     /// The preview and its sticker layer are added after the chrome, and the
     /// sticker layer claims every touch inside the preview rect. The history
     /// pill sits just below the top bar — i.e. *inside* that rect — so the
     /// chrome has to be lifted back above it or its buttons never see a tap.
+    ///
+    /// The accessory goes last: the keyboard lifts it over the preview and the
+    /// video controls, and it has to stay on top of both while it does.
     private func liftChromeAbovePreview() {
         view.bringSubviewToFront(topBar)
         view.bringSubviewToFront(historyBarBackground)
-        if let customToolbar {
-            view.bringSubviewToFront(customToolbar)
-        } else {
-            view.bringSubviewToFront(bottomToolbarBackground)
+        for chrome in [toolRowContainer, floatingDoneButton, bottomAccessory] {
+            if let chrome, chrome.superview === view { view.bringSubviewToFront(chrome) }
+        }
+    }
+
+    /// The topmost piece of chrome along the bottom edge, which the video
+    /// controls and the delete bin stack above: the tool row when it sits at the
+    /// bottom, else the floating Done button, else the accessory.
+    private var bottomChromeTop: UIView? {
+        switch appearance.toolbarPlacement {
+        case .bottom: return toolRowContainer ?? bottomAccessory
+        case .top:    return floatingDoneButton ?? bottomAccessory
         }
     }
 
@@ -343,7 +398,7 @@ public final class MediaEditorViewController: UIViewController {
     /// layered above the sticker layer the bin lives in. The gap leaves room for
     /// the bin's armed swell, spring overshoot included.
     private func trashCenterAboveBottomControls() -> CGPoint? {
-        let controls: UIView? = videoControlsTop ?? (customToolbar ?? bottomToolbarBackground)
+        let controls: UIView? = videoControlsTop ?? bottomChromeTop
         guard let controls, controls.superview != nil else { return nil }
         let controlsTop = view.convert(controls.bounds, from: controls).minY
         guard controlsTop > 0 else { return nil }      // not laid out yet
@@ -354,8 +409,7 @@ public final class MediaEditorViewController: UIViewController {
 
     private func setupChrome() {
         // Top bar: Cancel / Done
-        let cancel = makeTextButton(L10n.cancel, role: .dismissing, action: #selector(cancelTapped))
-        let done = makeTextButton(L10n.done, role: .confirming, action: #selector(doneTapped))
+        let cancel = makeCancelButton()
         historyBar.axis = .horizontal
         historyBar.alignment = .center
         historyBar.spacing = 16
@@ -370,9 +424,9 @@ public final class MediaEditorViewController: UIViewController {
 
         topBar.axis = .horizontal
         topBar.alignment = .center
+        topBar.spacing = 8
         topBar.addArrangedSubview(cancel)
-        topBar.addArrangedSubview(UIView())          // pushes Done to the trailing edge
-        topBar.addArrangedSubview(done)
+        topBar.addArrangedSubview(UIView())          // pushes the rest to the trailing edge
         topBar.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(topBar)
 
@@ -392,46 +446,124 @@ public final class MediaEditorViewController: UIViewController {
             historyBar.bottomAnchor.constraint(equalTo: historyBarBackground.contentView.bottomAnchor, constant: -4),
         ])
 
-        // A host-supplied row replaces the built-in bar outright.
+        setupBottomAccessory()
+
+        let row = makeToolRow()
+        toolRowContainer = row
+        switch appearance.toolbarPlacement {
+        case .top:
+            // Tools trail the close button; Done, if the editor shows one, drops
+            // to the bottom trailing corner where a send button would be.
+            if let row {
+                row.setContentCompressionResistancePriority(.required, for: .horizontal)
+                topBar.addArrangedSubview(row)
+            }
+            if showsDoneButton {
+                let done = makeTextButton(L10n.done, role: .confirming, action: #selector(doneTapped))
+                done.translatesAutoresizingMaskIntoConstraints = false
+                view.addSubview(done)
+                NSLayoutConstraint.activate([
+                    done.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+                    done.bottomAnchor.constraint(equalTo: bottomChromeGuide.topAnchor, constant: -12),
+                ])
+                floatingDoneButton = done
+            }
+        case .bottom:
+            if showsDoneButton {
+                topBar.addArrangedSubview(makeTextButton(L10n.done, role: .confirming, action: #selector(doneTapped)))
+            }
+            if let row {
+                row.translatesAutoresizingMaskIntoConstraints = false
+                view.addSubview(row)
+                NSLayoutConstraint.activate([
+                    // The row holds tools only, so it hugs its content and
+                    // centres rather than stretching the full width.
+                    row.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+                    row.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 12),
+                    row.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -12),
+                    row.bottomAnchor.constraint(equalTo: bottomChromeGuide.topAnchor, constant: -12),
+                ])
+            }
+        }
+
+        if let customToolbar, let toolbarProvider {
+            toolbarProvider.updateToolbar(customToolbar, editor: self)
+        }
+    }
+
+    /// Pins the host's accessory full-width to the keyboard (which rests on the
+    /// bottom safe area when hidden), and sizes `bottomChromeGuide` to match.
+    private func setupBottomAccessory() {
+        view.addLayoutGuide(bottomChromeGuide)
+        NSLayoutConstraint.activate([
+            bottomChromeGuide.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            bottomChromeGuide.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            bottomChromeGuide.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+        ])
+        guard let accessory = bottomAccessory else {
+            bottomChromeGuide.heightAnchor.constraint(equalToConstant: 0).isActive = true
+            return
+        }
+        accessory.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(accessory)
+        NSLayoutConstraint.activate([
+            accessory.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            accessory.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            accessory.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor),
+            bottomChromeGuide.heightAnchor.constraint(equalTo: accessory.heightAnchor),
+        ])
+    }
+
+    /// Builds the tool row — the provider's, when it supplies one — without
+    /// placing it; `setupChrome` decides where it goes.
+    private func makeToolRow() -> UIView? {
         if let provider = toolbarProvider,
            let custom = provider.makeToolbar(for: toolbarActions, editor: self) {
             customToolbar = custom
-            custom.translatesAutoresizingMaskIntoConstraints = false
-            view.addSubview(custom)
-            NSLayoutConstraint.activate([
-                custom.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 12),
-                custom.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -12),
-                custom.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-                custom.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
-            ])
-            provider.updateToolbar(custom, editor: self)
-            return
+            return custom
         }
+        let buttons = toolbarButtons()
+        guard !buttons.isEmpty else { return nil }
 
-        // Bottom toolbar: geometry tools + undo/redo, floating on a glass bar.
-        bottomToolbar.axis = .horizontal
-        bottomToolbar.distribution = .fill
-        bottomToolbar.spacing = 28
-        bottomToolbar.alignment = .center
-        for v in toolbarButtons() { bottomToolbar.addArrangedSubview(v) }
-        bottomToolbar.translatesAutoresizingMaskIntoConstraints = false
-        bottomToolbarBackground.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(bottomToolbarBackground)
-        bottomToolbarBackground.contentView.addSubview(bottomToolbar)
+        toolRow.axis = .horizontal
+        toolRow.distribution = .fill
+        toolRow.alignment = .center
+        for v in buttons { toolRow.addArrangedSubview(v) }
 
-        NSLayoutConstraint.activate([
-            // The row now holds tools only, so it hugs its content and centres
-            // rather than stretching the full width.
-            bottomToolbarBackground.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            bottomToolbarBackground.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 12),
-            bottomToolbarBackground.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -12),
-            bottomToolbarBackground.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
+        switch appearance.toolbarStyle {
+        case .circularButtons:
+            // Each button carries its own backing, so the row itself is bare.
+            toolRow.spacing = appearance.toolbarPlacement == .top ? 8 : 12
+            return toolRow
+        case .floatingBar:
+            // Tighter in the top bar, where it shares the width with Cancel.
+            toolRow.spacing = appearance.toolbarPlacement == .top ? 20 : 28
+            let inset: CGFloat = appearance.toolbarPlacement == .top ? 16 : 24
+            toolRow.translatesAutoresizingMaskIntoConstraints = false
+            toolRowBackground.contentView.addSubview(toolRow)
+            NSLayoutConstraint.activate([
+                toolRow.leadingAnchor.constraint(equalTo: toolRowBackground.contentView.leadingAnchor, constant: inset),
+                toolRow.trailingAnchor.constraint(equalTo: toolRowBackground.contentView.trailingAnchor, constant: -inset),
+                toolRow.topAnchor.constraint(equalTo: toolRowBackground.contentView.topAnchor, constant: 12),
+                toolRow.bottomAnchor.constraint(equalTo: toolRowBackground.contentView.bottomAnchor, constant: -12),
+            ])
+            return toolRowBackground
+        }
+    }
 
-            bottomToolbar.leadingAnchor.constraint(equalTo: bottomToolbarBackground.contentView.leadingAnchor, constant: 24),
-            bottomToolbar.trailingAnchor.constraint(equalTo: bottomToolbarBackground.contentView.trailingAnchor, constant: -24),
-            bottomToolbar.topAnchor.constraint(equalTo: bottomToolbarBackground.contentView.topAnchor, constant: 12),
-            bottomToolbar.bottomAnchor.constraint(equalTo: bottomToolbarBackground.contentView.bottomAnchor, constant: -12),
-        ])
+    /// Cancel as a titled bar button, or as an ✕ on a circular backing to match
+    /// ``EditorToolbarStyle/circularButtons``.
+    private func makeCancelButton() -> UIView {
+        switch appearance.toolbarStyle {
+        case .floatingBar:
+            return makeTextButton(L10n.cancel, role: .dismissing, action: #selector(cancelTapped))
+        case .circularButtons:
+            let button = makeSymbolButton(symbol: appearance.symbols[.cancel] ?? "xmark",
+                                          selector: #selector(cancelTapped))
+            button.accessibilityLabel = L10n.cancel
+            appearance.styleToolButton?(button, .cancel)
+            return appearance.makeCircularBacking(for: button)
+        }
     }
 
     private func setupCropChrome() {
@@ -606,9 +738,10 @@ public final class MediaEditorViewController: UIViewController {
         ])
     }
 
-    /// Builds the enabled geometry tool buttons plus undo/redo.
+    /// Builds the enabled tool buttons, each on its circular backing when the
+    /// appearance asks for one.
     private func toolbarButtons() -> [UIView] {
-        var buttons: [UIView] = []
+        var buttons: [UIButton] = []
         let tools = configuration.tools(for: item.kind)
         if tools.contains(.crop) {
             buttons.append(makeToolButton(.crop, selector: #selector(cropTapped)))
@@ -635,11 +768,20 @@ public final class MediaEditorViewController: UIViewController {
             buttons.append(makeToolButton(.addPhoto, selector: #selector(addPhotoTapped)))
         }
         if tools.contains(.audio) {
-            // Stays out of the row until the asset is known to carry audio.
-            audioButton.isHidden = true
             buttons.append(audioButton)
         }
-        return buttons
+        let views: [UIView] = buttons.map { button in
+            let host = appearance.toolbarStyle == .circularButtons
+                ? appearance.makeCircularBacking(for: button)
+                : button
+            if button === audioButton {
+                // Stays out of the row until the asset is known to carry audio.
+                audioButtonHost = host
+                host.isHidden = true
+            }
+            return host
+        }
+        return views
     }
 
     /// A tool-row button for `action`, styled through the appearance so a host
@@ -740,21 +882,30 @@ public final class MediaEditorViewController: UIViewController {
         toolbarProvider.updateToolbar(customToolbar, editor: self)
     }
 
-    /// Shows or hides whichever tool row is in play. A custom row can opt out
-    /// of being hidden while a modal tool is open.
+    /// Shows or hides the main-mode chrome along the bottom: whichever tool row
+    /// is in play, the floating Done button and the accessory. A custom row can
+    /// opt out of being hidden while a modal tool is open — though at the top it
+    /// lives in the top bar, which every tool swaps out for its own.
     private func setMainToolbarHidden(_ hidden: Bool) {
+        if hidden { bottomAccessory?.endEditing(true) }     // a tool is taking over the screen
+        bottomAccessory?.isHidden = hidden
+        floatingDoneButton?.isHidden = hidden
         if let customToolbar {
             guard toolbarProvider?.hidesToolbarInToolMode(customToolbar) ?? true else { return }
             customToolbar.isHidden = hidden
         } else {
-            bottomToolbarBackground.isHidden = hidden
+            toolRowContainer?.isHidden = hidden
         }
     }
 
-    /// The top of the tool row, whichever one is in play — the trim scrubber
-    /// sits above it.
-    private var toolbarTopAnchor: NSLayoutYAxisAnchor {
-        customToolbar?.topAnchor ?? bottomToolbar.topAnchor
+    /// What the video controls stack above — the tool row when it sits at the
+    /// bottom (the buttons themselves, for the glass bar), otherwise the floating
+    /// Done button or the accessory's resting place.
+    private var bottomChromeTopAnchor: NSLayoutYAxisAnchor {
+        if appearance.toolbarPlacement == .bottom, let toolRowContainer {
+            return toolRowContainer === toolRowBackground ? toolRow.topAnchor : toolRowContainer.topAnchor
+        }
+        return floatingDoneButton?.topAnchor ?? bottomChromeGuide.topAnchor
     }
 
     // MARK: - Crop mode
@@ -973,7 +1124,7 @@ public final class MediaEditorViewController: UIViewController {
             NSLayoutConstraint.activate([
                 trimScrubber.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
                 trimScrubber.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
-                trimScrubber.bottomAnchor.constraint(equalTo: toolbarTopAnchor, constant: -12),
+                trimScrubber.bottomAnchor.constraint(equalTo: bottomChromeTopAnchor, constant: -12),
                 trimScrubber.heightAnchor.constraint(equalToConstant: 60),
             ])
         }
@@ -1002,7 +1153,7 @@ public final class MediaEditorViewController: UIViewController {
         view.addSubview(timeLabel)
         NSLayoutConstraint.activate([
             timeLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            timeLabel.bottomAnchor.constraint(equalTo: showsTrimScrubber ? trimScrubber.topAnchor : toolbarTopAnchor,
+            timeLabel.bottomAnchor.constraint(equalTo: showsTrimScrubber ? trimScrubber.topAnchor : bottomChromeTopAnchor,
                                               constant: -8),
             timeLabel.heightAnchor.constraint(equalToConstant: 16),
         ])
@@ -1160,7 +1311,7 @@ public final class MediaEditorViewController: UIViewController {
     /// Mirrors `recipe.removeAudio` onto the toggle, and keeps it out of the
     /// toolbar entirely for a source that has no audio to remove.
     private func updateAudioButton() {
-        audioButton.isHidden = !hasAudioTrack
+        (audioButtonHost ?? audioButton).isHidden = !hasAudioTrack
         let muted = recipe.removeAudio
         // The "on" state gets its own glyph; a host overriding the symbol for
         // `.toggleAudio` keeps control of the "off" one.
@@ -1774,7 +1925,14 @@ extension MediaEditorViewController: OverlayContainerDelegate {
     /// paused state once the transport has faded out. A tap that merely clears a
     /// sticker selection is left alone, so dismissing a selection doesn't also
     /// stop the video.
+    ///
+    /// While the accessory is being typed into, a tap on the media only puts the
+    /// keyboard away, the way a chat composer behaves.
     func overlayContainer(_ container: OverlayContainerView, didTapCanvasWithSelection hadSelection: Bool) {
+        if let bottomAccessory, bottomAccessory.containsFirstResponder {
+            bottomAccessory.endEditing(true)
+            return
+        }
         guard case .video = item, mode == .normal, !hadSelection else { return }
         togglePlayback()
     }
@@ -1799,6 +1957,13 @@ extension MediaEditorViewController: OverlayContainerDelegate {
             apply(next)
             overlayContainer.reload(overlays: recipe.overlays, images: overlayImages)
         }
+    }
+}
+
+private extension UIView {
+    /// Whether this view or anything inside it holds the keyboard.
+    var containsFirstResponder: Bool {
+        isFirstResponder || subviews.contains { $0.containsFirstResponder }
     }
 }
 

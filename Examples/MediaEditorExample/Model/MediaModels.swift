@@ -52,6 +52,9 @@ enum EditorKind: Hashable {
     /// The turnkey editor, re-skinned by the host: a custom appearance plus a
     /// host-supplied tool row.
     case branded
+    /// The turnkey editor laid out as a chat app's pre-send screen: tools across
+    /// the top, a host-supplied caption bar at the bottom.
+    case chat
     case custom
 }
 
