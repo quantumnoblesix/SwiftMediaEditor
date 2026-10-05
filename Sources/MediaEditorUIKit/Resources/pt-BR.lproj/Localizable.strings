@@ -26,6 +26,14 @@
 "export.failed.title" = "Falha na exportação";
 /* Export progress; %d is the percentage */
 "export.progress" = "Exportando… %d%%";
+"export.progress.multi" = "Exportando %d de %d";
+"strip.add" = "Adicionar mídia";
+"strip.remove" = "Remover";
+"strip.move.left" = "Mover para antes";
+"strip.move.right" = "Mover para depois";
+"strip.item.photo" = "Foto %d de %d";
+"strip.item.video" = "Vídeo %d de %d";
+"strip.item.other" = "Item %d de %d";
 
 /* Title of the filters tool */
 "tool.filters.title" = "Filtros";

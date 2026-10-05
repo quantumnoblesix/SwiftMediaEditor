@@ -31,6 +31,7 @@ three.
 - ``EditorTools``
 - ``MediaKind``
 - ``VideoExportPreset``
+- ``MediaEditorFinishMode``
 
 ### Rendering
 

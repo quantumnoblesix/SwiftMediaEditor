@@ -91,6 +91,30 @@ public struct EditorAppearance {
     /// Diameter of each button under ``EditorToolbarStyle/circularButtons``.
     public var circularButtonDiameter: CGFloat = 44
 
+    // MARK: Thumbnail strip
+
+    /// Side of each square cell in a multi-item session's thumbnail strip.
+    public var thumbnailSize: CGFloat = 56
+    /// Corner radius of the strip's cells.
+    public var thumbnailCornerRadius: CGFloat = 8
+    /// Gap between the strip's cells.
+    public var thumbnailSpacing: CGFloat = 8
+    /// Fill behind the strip, edge to edge. `nil` — the default — leaves the
+    /// cells on the editor's own black.
+    public var thumbnailStripBackground: UIColor?
+    /// Fade the strip out while the keyboard is up, so whatever the bottom
+    /// accessory grows upward while typing — a list of suggestions, say — has
+    /// the room. The space it takes stays reserved, so nothing behind it moves.
+    public var hidesThumbnailStripWithKeyboard: Bool = true
+    /// Let the user reorder items by long-pressing and dragging a thumbnail.
+    public var allowsReordering: Bool = false
+    /// Let a horizontal swipe on empty canvas page to the next or previous item.
+    /// A swipe that starts on a sticker still moves the sticker.
+    public var allowsSwipeBetweenItems: Bool = true
+    /// Applied to every strip cell after the built-in styling, with the item
+    /// it shows and whether it's selected — to re-skin cells in place.
+    public var styleThumbnailCell: ((UIView, MediaEditorItem, _ isSelected: Bool) -> Void)?
+
     /// Per-action glyph overrides. Anything absent falls back to
     /// ``EditorAction/defaultSymbolName``.
     public var symbols: [EditorAction: String] = [:]
