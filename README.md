@@ -3,7 +3,7 @@
 A native, dependency-free media editor for iOS — edit **photos** and **videos**
 with the same non-destructive engine, usable from both **UIKit** and **SwiftUI**.
 
-> Current release: **1.1.0**. See the [changelog](CHANGELOG.md) for what's included.
+> Current release: **1.2.0**. See the [changelog](CHANGELOG.md) for what's included.
 
 ## Features
 
@@ -254,7 +254,7 @@ see `BrandedToolbar.swift`.
 Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/quantumnoblesix/SwiftMediaEditor.git", from: "1.1.0")
+.package(url: "https://github.com/quantumnoblesix/SwiftMediaEditor.git", from: "1.2.0")
 ```
 
 then add the product to your target — SwiftPM names the package after the
@@ -473,6 +473,8 @@ swift test
 9. ✅ Release 1.1.0 — chat-style layout with a host bottom bar, always-dark
    chrome, edits anchored to the media through crop and rotation, drawing
    layered among the stickers
+10. ✅ Release 1.2.0 — multi-item sessions with a thumbnail strip, and
+    `EditRenderer` for rendering edits in the background
 
 Photos and videos are feature-complete. Video supports the crop tool (aspect
 presets, straighten dial, rotate/flip), drawing, text and stickers, timeline
