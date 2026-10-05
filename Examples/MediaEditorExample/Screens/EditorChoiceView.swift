@@ -38,6 +38,15 @@ struct EditorChoiceView: View {
             }
 
             card(
+                title: "Chat Editor",
+                subtitle: "Tools along the top and a caption bar with a send button, like a messaging app.",
+                systemImage: "bubble.left.and.text.bubble.right",
+                prominent: false
+            ) {
+                coordinator.openEditor(.chat)
+            }
+
+            card(
                 title: "Custom Editor",
                 subtitle: source.isPhoto
                     ? "A lightweight editor built on the headless engine."

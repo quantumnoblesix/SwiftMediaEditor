@@ -14,6 +14,7 @@
 
 import UIKit
 import PencilKit
+import AVFoundation
 import Testing
 import MediaEditorCore
 @testable import MediaEditorUIKit
@@ -113,10 +114,11 @@ struct VideoDrawingEditorTests {
         return editor
     }
 
-    private func first<T: UIView>(_ type: T.Type, in root: UIView) -> T? {
-        if let match = root as? T { return match }
+    private func first<T: UIView>(_ type: T.Type, in root: UIView,
+                                  where matches: (T) -> Bool = { _ in true }) -> T? {
+        if let match = root as? T, matches(match) { return match }
         for subview in root.subviews {
-            if let found = first(type, in: subview) { return found }
+            if let found = first(type, in: subview, where: matches) { return found }
         }
         return nil
     }
@@ -168,11 +170,14 @@ struct VideoDrawingEditorTests {
         #expect(filmstrip.isHidden)
 
         let canvas = try #require(first(PKCanvasView.self, in: editor.view))
-        let video = try #require(editor.videoDrawingView.superview)
+        let video = try #require(first(UIView.self, in: editor.view) { view in
+            view.layer.sublayers?.contains { $0 is AVPlayerLayer } ?? false
+        })
         let videoFrame = editor.view.convert(video.bounds, from: video)
-        #expect(abs(canvas.frame.minY - videoFrame.minY) < 0.5
-                && abs(canvas.frame.width - videoFrame.width) < 0.5
-                && abs(canvas.frame.height - videoFrame.height) < 0.5,
+        let canvasFrame = editor.view.convert(canvas.bounds, from: canvas)
+        #expect(abs(canvasFrame.minY - videoFrame.minY) < 0.5
+                && abs(canvasFrame.width - videoFrame.width) < 0.5
+                && abs(canvasFrame.height - videoFrame.height) < 0.5,
                 "strokes are authored against the video frame itself")
         canvas.drawing = topLeftStroke(in: canvas.bounds.size)
 
@@ -181,14 +186,14 @@ struct VideoDrawingEditorTests {
 
         #expect(!editor.isActive(.drawing))
         #expect(editor.recipe.drawing != nil)
-        #expect(editor.videoDrawingView.image != nil, "the strokes stay over the video once applied")
-        #expect(!editor.videoDrawingView.isHidden)
+        #expect(editor.drawingLayerView.image != nil, "the strokes stay over the video once applied")
+        #expect(!editor.drawingLayerView.isHidden)
         #expect(!transport.isHidden)
         #expect(!filmstrip.isHidden)
 
         editor.undo()
         #expect(editor.recipe.drawing == nil)
-        #expect(editor.videoDrawingView.image == nil, "undo takes the strokes off the preview too")
+        #expect(editor.drawingLayerView.image == nil, "undo takes the strokes off the preview too")
     }
 }
 

@@ -46,6 +46,16 @@ public final class MediaEditorViewController: UIViewController {
     /// `perform(_:)`. See ``MediaEditorToolbarProviding``.
     public private(set) weak var toolbarProvider: (any MediaEditorToolbarProviding)?
 
+    /// A host-supplied bar pinned under everything else — a caption field and a
+    /// send button, say. It spans the full width, sizes itself, and rides up
+    /// with the keyboard. See ``init(item:recipe:configuration:appearance:toolbarProvider:bottomAccessory:onFinish:)``.
+    public let bottomAccessory: UIView?
+
+    /// Whether the editor draws its own Done button. A bottom accessory takes
+    /// that job over — its send button calls `finish()` — so the editor drops
+    /// its own rather than offering two ways to confirm.
+    public var showsDoneButton: Bool { bottomAccessory == nil }
+
     /// Undo/redo history over the working recipe.
     private var history: EditHistory<EditRecipe>
 
@@ -55,6 +65,7 @@ public final class MediaEditorViewController: UIViewController {
             // Overlays are live views over the render, so an overlay-only edit
             // (dragging a sticker) needs no new bitmap at all.
             if recipe.rendersDifferently(from: oldValue) { renderPreview() }
+            if isViewLoaded { updateDrawingLayer() }
             if case .video = item, isViewLoaded {
                 syncVideoState()
             }
@@ -99,13 +110,18 @@ public final class MediaEditorViewController: UIViewController {
     private var playerLayer: AVPlayerLayer?
     /// Clips the player layer to the recipe's crop; sized to the rendered output.
     private let videoContainer = UIView()
-    /// The recipe's drawing over the playing video, inside the crop clip. Photos
-    /// bake strokes into the preview bitmap; a video has no bitmap to bake into.
-    /// Internal so tests can check it.
-    let videoDrawingView = UIImageView()
-    /// The drawing `videoDrawingView` shows, so recipe changes that leave the
+    /// The recipe's strokes on screen, for photos and videos alike. They live in
+    /// the sticker layer rather than the preview bitmap, so they stack among the
+    /// stickers exactly as the export stacks them. Internal so tests can check it.
+    var drawingLayerView: UIImageView { overlayContainer.drawingView }
+    /// The drawing `drawingLayerView` shows, so recipe changes that leave the
     /// strokes alone don't re-rasterize them.
-    private var renderedVideoDrawing: DrawingData?
+    private var renderedDrawing: DrawingData?
+    /// The pixel size `renderedDrawing` was rasterized at.
+    private var renderedDrawingPixels: CGSize = .zero
+    /// The drawing on screen — the recipe's, or in crop mode its whole-frame
+    /// carry.
+    private var shownDrawing: DrawingData?
     private let videoArtworkRenderer = VideoArtworkRenderer()
     /// The video's oriented display size, resolved once the asset loads.
     /// Internal so tests can stand in for a real asset.
@@ -146,11 +162,24 @@ public final class MediaEditorViewController: UIViewController {
     private let topBar = UIStackView()
     private let historyBar = UIStackView()
     private lazy var historyBarBackground = appearance.makeBarBackground(cornerRadius: 13)
-    private let bottomToolbar = UIStackView()
-    
-    private lazy var bottomToolbarBackground = appearance.makeBarBackground(cornerRadius: appearance.toolbarCornerRadius)
+    /// What went into the layout for undo/redo: the glass pill, or — under
+    /// ``EditorToolbarStyle/circularButtons`` — the bare row of circles.
+    private var historyContainer: UIView = UIView()
+    /// The built-in tool buttons, laid out in a row.
+    private let toolRow = UIStackView()
+    private lazy var toolRowBackground = appearance.makeBarBackground(cornerRadius: appearance.toolbarCornerRadius)
     /// A host-supplied tool row, when `toolbarProvider` returned one.
     private var customToolbar: UIView?
+    /// Whatever went into the layout for the tool row — the custom row, the
+    /// glass bar, or the bare row of circular buttons.
+    private var toolRowContainer: UIView?
+    /// The Done button, when `toolbarPlacement` is `.top` and pushes it down to
+    /// the bottom trailing corner.
+    private var floatingDoneButton: UIButton?
+    /// Reserves the accessory's resting height above the bottom safe area. The
+    /// accessory itself follows the keyboard; the preview and video controls
+    /// lay out against this instead, so they stay put while the user types.
+    private let bottomChromeGuide = UILayoutGuide()
 
     // Overlay (sticker) layer, above the image preview.
     private let overlayContainer = OverlayContainerView()
@@ -165,6 +194,11 @@ public final class MediaEditorViewController: UIViewController {
     private let cropAspectScroll = UIScrollView()
     private lazy var cropAspectBarBackground = appearance.makeBarBackground(cornerRadius: 24)
     private var aspectButtons: [(preset: AspectPreset, button: UIButton)] = []
+
+    /// Whether crop mode is showing the stickers and drawing over the frame
+    /// they belong to. They step aside while the user moves the frame, rotates
+    /// or straightens, and come back laid over the new frame once they let go.
+    private var cropShowsEdits = false
 
     // Crop-mode geometry state (folded into the recipe on apply).
     private var cropRotationBase: Double = 0           // 90° preset steps
@@ -183,10 +217,19 @@ public final class MediaEditorViewController: UIViewController {
     private var filterWorkingFilter: PhotoFilter = .none
 
     private lazy var undoButton = makeToolButton(.undo, selector: #selector(undoTapped),
-                                                 pointSize: appearance.historySymbolPointSize)
+                                                 pointSize: historySymbolPointSize)
     private lazy var redoButton = makeToolButton(.redo, selector: #selector(redoTapped),
-                                                 pointSize: appearance.historySymbolPointSize)
+                                                 pointSize: historySymbolPointSize)
+    /// Undo/redo glyphs match the tool row's when they get circles of their
+    /// own; on the shared pill they stay smaller.
+    private var historySymbolPointSize: CGFloat {
+        appearance.toolbarStyle == .circularButtons ? appearance.toolSymbolPointSize
+                                                     : appearance.historySymbolPointSize
+    }
     private lazy var audioButton = makeToolButton(.toggleAudio, selector: #selector(toggleAudioTapped))
+    /// What to hide to take the audio toggle out of the row — its circular
+    /// backing under that style, otherwise the button itself.
+    private var audioButtonHost: UIView?
 
     // MARK: - Init
 
@@ -197,6 +240,13 @@ public final class MediaEditorViewController: UIViewController {
     ///   - appearance: how the built-in chrome is styled.
     ///   - toolbarProvider: supplies a replacement tool row, or `nil` for the
     ///     built-in one. Held weakly — keep your own reference to it.
+    ///   - bottomAccessory: a bar the host owns, pinned full-width to the
+    ///     bottom edge and lifted by the keyboard — typically a caption field and
+    ///     a send button. Its background runs under the home indicator, so lay
+    ///     its content out against its `safeAreaLayoutGuide` (or its layout
+    ///     margins) and let the height follow. Call `finish()` from its send
+    ///     action: with an accessory installed the editor shows no Done button of
+    ///     its own. It is hidden while a tool (crop, drawing, filters) is open.
     ///   - onFinish: completion handler delivering the result.
     public init(
         item: MediaItem,
@@ -204,12 +254,14 @@ public final class MediaEditorViewController: UIViewController {
         configuration: EditorConfiguration = .default,
         appearance: EditorAppearance = .default,
         toolbarProvider: (any MediaEditorToolbarProviding)? = nil,
+        bottomAccessory: UIView? = nil,
         onFinish: ((EditorResult) -> Void)? = nil
     ) {
         self.item = item
         self.configuration = configuration
         self.appearance = appearance
         self.toolbarProvider = toolbarProvider
+        self.bottomAccessory = bottomAccessory
         self.recipe = recipe
         self.history = EditHistory(initial: recipe, limit: configuration.historyLimit)
         if case let .photo(image) = item {
@@ -222,6 +274,16 @@ public final class MediaEditorViewController: UIViewController {
         }
         super.init(nibName: nil, bundle: nil)
         modalPresentationStyle = .fullScreen
+        // The editor is dark whatever the system setting — media reads best on
+        // black, and the chrome is designed for it. The override flows down to
+        // the host's accessory and toolbar, and `present` extends it to sheets.
+        overrideUserInterfaceStyle = .dark
+        // The tool palette floats in its own window, out of the override's reach.
+        toolPicker.overrideUserInterfaceStyle = .dark
+        // …but its swatches show ink as it will really come out. In dark mode
+        // PencilKit would otherwise adapt them (black shown as white), and the
+        // user would pick a colour the result doesn't have.
+        toolPicker.colorUserInterfaceStyle = .light
         // Restore image-overlay content from a resumed recipe.
         for overlay in recipe.overlays {
             if case let .image(ref) = overlay.content, let data = ref.data,
@@ -236,6 +298,18 @@ public final class MediaEditorViewController: UIViewController {
 
     // MARK: - Lifecycle
 
+    public override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
+
+    /// Keeps whatever the editor presents — the text editor, the photo picker,
+    /// an alert — as dark as the editor itself. A modal gets its traits from the
+    /// window rather than from the presenter, so the override doesn't reach it
+    /// on its own.
+    public override func present(_ viewControllerToPresent: UIViewController, animated flag: Bool,
+                                 completion: (() -> Void)? = nil) {
+        viewControllerToPresent.overrideUserInterfaceStyle = .dark
+        super.present(viewControllerToPresent, animated: flag, completion: completion)
+    }
+
     public override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
@@ -247,7 +321,9 @@ public final class MediaEditorViewController: UIViewController {
         liftChromeAbovePreview()
         renderPreview()
         overlayContainer.reload(overlays: recipe.overlays, images: overlayImages)
+        updateDrawingLayer()
         updateHistoryButtons()
+        updateHistoryVisibility(animated: false)
     }
 
     public override func viewDidLayoutSubviews() {
@@ -257,13 +333,9 @@ public final class MediaEditorViewController: UIViewController {
         // Container shares the image view's frame, so the displayed-image rect
         // (in image-view bounds coordinates) maps directly to container bounds.
         overlayContainer.frame = imageView.frame
-        overlayContainer.imageFrame = displayedImageFrame()
-        overlayContainer.preferredTrashCenter = trashCenterAboveBottomControls()
+        syncOverlayCanvas()
         if mode == .crop {
             positionCropOverlay()
-        }
-        if mode == .draw {
-            canvasView.frame = view.convert(displayedImageFrame(), from: imageView)
         }
     }
 
@@ -307,12 +379,15 @@ public final class MediaEditorViewController: UIViewController {
             imageView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
             imageView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
             imageView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 56),
-            imageView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -88),
+            previewBottomConstraint(),
         ])
 
         // Sticker layer floats over the image; positioned in layout passes.
         overlayContainer.delegate = self
         overlayContainer.appearance = appearance
+        // Asked at drag time rather than stored at layout: the accessory's
+        // height can settle after the first pass, and the keyboard moves it.
+        overlayContainer.trashCenterProvider = { [weak self] in self?.trashCenterAboveBottomControls() }
         overlayContainer.clipsToBounds = false
         view.addSubview(overlayContainer)
 
@@ -321,58 +396,75 @@ public final class MediaEditorViewController: UIViewController {
         }
     }
 
+    /// Where the preview stops. Under a bottom tool row it leaves the row's
+    /// height plus breathing room; with the row at the top it only has to clear
+    /// the floating Done button or the accessory.
+    private func previewBottomConstraint() -> NSLayoutConstraint {
+        switch appearance.toolbarPlacement {
+        case .bottom:
+            return imageView.bottomAnchor.constraint(equalTo: bottomChromeGuide.topAnchor, constant: -88)
+        case .top:
+            let anchor = floatingDoneButton?.topAnchor ?? bottomChromeGuide.topAnchor
+            return imageView.bottomAnchor.constraint(equalTo: anchor, constant: -16)
+        }
+    }
+
     /// The preview and its sticker layer are added after the chrome, and the
     /// sticker layer claims every touch inside the preview rect. The history
     /// pill sits just below the top bar — i.e. *inside* that rect — so the
     /// chrome has to be lifted back above it or its buttons never see a tap.
+    ///
+    /// The accessory goes last: the keyboard lifts it over the preview and the
+    /// video controls, and it has to stay on top of both while it does.
     private func liftChromeAbovePreview() {
         view.bringSubviewToFront(topBar)
-        view.bringSubviewToFront(historyBarBackground)
-        if let customToolbar {
-            view.bringSubviewToFront(customToolbar)
-        } else {
-            view.bringSubviewToFront(bottomToolbarBackground)
+        view.bringSubviewToFront(historyContainer)
+        for chrome in [toolRowContainer, floatingDoneButton, bottomAccessory] {
+            if let chrome, chrome.superview === view { view.bringSubviewToFront(chrome) }
         }
     }
 
-    /// Where the sticker delete bin goes: centred just above the bottom controls
-    /// — for a video the time readout on top of them, otherwise the tool row —
-    /// which is close to where the thumb already is.
+    /// Where the sticker delete bin goes: centred just above the highest control
+    /// along the bottom — the video's time readout or filmstrip, the tool row,
+    /// the floating Done button, the accessory — which is close to where the
+    /// thumb already is.
     ///
-    /// It has to clear that control rather than tuck beneath it: the controls are
-    /// layered above the sticker layer the bin lives in. The gap leaves room for
-    /// the bin's armed swell, spring overshoot included.
+    /// It has to clear all of them rather than tuck beneath one: they are
+    /// layered above the sticker layer the bin lives in, and with a bottom tool
+    /// row stacked on an accessory, or the keyboard lifting the accessory over
+    /// the video controls, the lowest one alone isn't enough. The gap leaves
+    /// room for the bin's armed swell, spring overshoot included.
     private func trashCenterAboveBottomControls() -> CGPoint? {
-        let controls: UIView? = videoControlsTop ?? (customToolbar ?? bottomToolbarBackground)
-        guard let controls, controls.superview != nil else { return nil }
-        let controlsTop = view.convert(controls.bounds, from: controls).minY
-        guard controlsTop > 0 else { return nil }      // not laid out yet
+        let filmstrip: UIView? = showsTrimScrubber ? trimScrubber : nil
+        let candidates = [videoControlsTop, filmstrip, toolRowAtBottom, floatingDoneButton, bottomAccessory]
+        let tops = candidates.compactMap { control -> CGFloat? in
+            // Hidden controls count too: the time readout stays hidden until the
+            // clip loads, and the bin should already clear the spot it takes.
+            guard let control, control.superview != nil else { return nil }
+            let frame = view.convert(control.bounds, from: control)
+            return frame.height > 0 ? frame.minY : nil        // not laid out yet
+        }
+        guard let controlsTop = tops.min(), controlsTop > 0 else { return nil }
         let center = CGPoint(x: view.bounds.midX,
                              y: controlsTop - 16 - StickerTrashView.diameter / 2)
         return overlayContainer.convert(center, from: view)
     }
 
+    /// The tool row, when it sits along the bottom rather than in the top bar.
+    private var toolRowAtBottom: UIView? {
+        appearance.toolbarPlacement == .bottom ? toolRowContainer : nil
+    }
+
     private func setupChrome() {
         // Top bar: Cancel / Done
-        let cancel = makeTextButton(L10n.cancel, role: .dismissing, action: #selector(cancelTapped))
-        let done = makeTextButton(L10n.done, role: .confirming, action: #selector(doneTapped))
-        historyBar.axis = .horizontal
-        historyBar.alignment = .center
-        historyBar.spacing = 16
-        historyBar.addArrangedSubview(undoButton)
-        historyBar.addArrangedSubview(redoButton)
-        historyBar.translatesAutoresizingMaskIntoConstraints = false
-        historyBarBackground.translatesAutoresizingMaskIntoConstraints = false
-        historyBarBackground.contentView.addSubview(historyBar)
-        // Its own row under Cancel rather than beside it, so the top bar keeps
-        // the familiar Cancel / Done shape.
-        view.addSubview(historyBarBackground)
+        let cancel = makeCancelButton()
+        setupHistoryBar()
 
         topBar.axis = .horizontal
         topBar.alignment = .center
+        topBar.spacing = 8
         topBar.addArrangedSubview(cancel)
-        topBar.addArrangedSubview(UIView())          // pushes Done to the trailing edge
-        topBar.addArrangedSubview(done)
+        topBar.addArrangedSubview(UIView())          // pushes the rest to the trailing edge
         topBar.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(topBar)
 
@@ -383,55 +475,174 @@ public final class MediaEditorViewController: UIViewController {
             topBar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
             topBar.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
 
-            historyBarBackground.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
-            historyBarBackground.topAnchor.constraint(equalTo: topBar.bottomAnchor, constant: 10),
-
-            historyBar.leadingAnchor.constraint(equalTo: historyBarBackground.contentView.leadingAnchor, constant: 12),
-            historyBar.trailingAnchor.constraint(equalTo: historyBarBackground.contentView.trailingAnchor, constant: -12),
-            historyBar.topAnchor.constraint(equalTo: historyBarBackground.contentView.topAnchor, constant: 4),
-            historyBar.bottomAnchor.constraint(equalTo: historyBarBackground.contentView.bottomAnchor, constant: -4),
+            historyContainer.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            historyContainer.topAnchor.constraint(equalTo: topBar.bottomAnchor, constant: 10),
         ])
 
-        // A host-supplied row replaces the built-in bar outright.
+        setupBottomAccessory()
+
+        let row = makeToolRow()
+        toolRowContainer = row
+        switch appearance.toolbarPlacement {
+        case .top:
+            // Tools trail the close button; Done, if the editor shows one, drops
+            // to the bottom trailing corner where a send button would be.
+            if let row {
+                row.setContentCompressionResistancePriority(.required, for: .horizontal)
+                topBar.addArrangedSubview(row)
+            }
+            if showsDoneButton {
+                let done = makeTextButton(L10n.done, role: .confirming, action: #selector(doneTapped))
+                done.translatesAutoresizingMaskIntoConstraints = false
+                view.addSubview(done)
+                NSLayoutConstraint.activate([
+                    done.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+                    done.bottomAnchor.constraint(equalTo: bottomChromeGuide.topAnchor, constant: -12),
+                ])
+                floatingDoneButton = done
+            }
+        case .bottom:
+            if showsDoneButton {
+                topBar.addArrangedSubview(makeTextButton(L10n.done, role: .confirming, action: #selector(doneTapped)))
+            }
+            if let row {
+                row.translatesAutoresizingMaskIntoConstraints = false
+                view.addSubview(row)
+                NSLayoutConstraint.activate([
+                    // The row holds tools only, so it hugs its content and
+                    // centres rather than stretching the full width.
+                    row.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+                    row.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 12),
+                    row.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -12),
+                    row.bottomAnchor.constraint(equalTo: bottomChromeGuide.topAnchor, constant: -12),
+                ])
+            }
+        }
+
+        if let customToolbar, let toolbarProvider {
+            toolbarProvider.updateToolbar(customToolbar, editor: self)
+        }
+    }
+
+    /// Undo and redo, on their own row under Cancel rather than beside it, so
+    /// the top bar keeps its shape. Drawn like the tool row: two glyphs sharing
+    /// a small glass pill, or a circle each.
+    private func setupHistoryBar() {
+        historyBar.axis = .horizontal
+        historyBar.alignment = .center
+        historyBar.translatesAutoresizingMaskIntoConstraints = false
+        switch appearance.toolbarStyle {
+        case .circularButtons:
+            historyBar.spacing = 8
+            historyBar.addArrangedSubview(appearance.makeCircularBacking(for: undoButton))
+            historyBar.addArrangedSubview(appearance.makeCircularBacking(for: redoButton))
+            historyContainer = historyBar
+        case .floatingBar:
+            historyBar.spacing = 16
+            historyBar.addArrangedSubview(undoButton)
+            historyBar.addArrangedSubview(redoButton)
+            historyBarBackground.translatesAutoresizingMaskIntoConstraints = false
+            historyBarBackground.contentView.addSubview(historyBar)
+            NSLayoutConstraint.activate([
+                historyBar.leadingAnchor.constraint(equalTo: historyBarBackground.contentView.leadingAnchor, constant: 12),
+                historyBar.trailingAnchor.constraint(equalTo: historyBarBackground.contentView.trailingAnchor, constant: -12),
+                historyBar.topAnchor.constraint(equalTo: historyBarBackground.contentView.topAnchor, constant: 4),
+                historyBar.bottomAnchor.constraint(equalTo: historyBarBackground.contentView.bottomAnchor, constant: -4),
+            ])
+            historyContainer = historyBarBackground
+        }
+        view.addSubview(historyContainer)
+    }
+
+    /// Pins the host's accessory full-width to the keyboard, and sizes
+    /// `bottomChromeGuide` to match.
+    ///
+    /// Like a toolbar, the accessory runs to the physical bottom edge so its
+    /// background fills the home-indicator strip, and keeps its content clear
+    /// of that strip through its own `safeAreaInsets`. Those follow the bar: on
+    /// top of the keyboard it no longer overlaps the strip, so the inset drops to
+    /// zero and there is no gap above the keys.
+    private func setupBottomAccessory() {
+        view.addLayoutGuide(bottomChromeGuide)
+        NSLayoutConstraint.activate([
+            bottomChromeGuide.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            bottomChromeGuide.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+        ])
+        guard let accessory = bottomAccessory else {
+            NSLayoutConstraint.activate([
+                bottomChromeGuide.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+                bottomChromeGuide.heightAnchor.constraint(equalToConstant: 0),
+            ])
+            return
+        }
+        // With the keyboard down the guide rests on the bottom edge rather than
+        // the safe area, which the accessory handles itself.
+        view.keyboardLayoutGuide.usesBottomSafeArea = false
+        accessory.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(accessory)
+        NSLayoutConstraint.activate([
+            accessory.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            accessory.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            accessory.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor),
+            // The bar's content height, above the safe area: resting, the bar
+            // also covers the home-indicator strip; lifted by the keyboard it
+            // doesn't. Measuring its content keeps the guide — and everything
+            // laid out on it — still while the user types.
+            bottomChromeGuide.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            bottomChromeGuide.heightAnchor.constraint(equalTo: accessory.safeAreaLayoutGuide.heightAnchor),
+        ])
+    }
+
+    /// Builds the tool row — the provider's, when it supplies one — without
+    /// placing it; `setupChrome` decides where it goes.
+    private func makeToolRow() -> UIView? {
         if let provider = toolbarProvider,
            let custom = provider.makeToolbar(for: toolbarActions, editor: self) {
             customToolbar = custom
-            custom.translatesAutoresizingMaskIntoConstraints = false
-            view.addSubview(custom)
-            NSLayoutConstraint.activate([
-                custom.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 12),
-                custom.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -12),
-                custom.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-                custom.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
-            ])
-            provider.updateToolbar(custom, editor: self)
-            return
+            return custom
         }
+        let buttons = toolbarButtons()
+        guard !buttons.isEmpty else { return nil }
 
-        // Bottom toolbar: geometry tools + undo/redo, floating on a glass bar.
-        bottomToolbar.axis = .horizontal
-        bottomToolbar.distribution = .fill
-        bottomToolbar.spacing = 28
-        bottomToolbar.alignment = .center
-        for v in toolbarButtons() { bottomToolbar.addArrangedSubview(v) }
-        bottomToolbar.translatesAutoresizingMaskIntoConstraints = false
-        bottomToolbarBackground.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(bottomToolbarBackground)
-        bottomToolbarBackground.contentView.addSubview(bottomToolbar)
+        toolRow.axis = .horizontal
+        toolRow.distribution = .fill
+        toolRow.alignment = .center
+        for v in buttons { toolRow.addArrangedSubview(v) }
 
-        NSLayoutConstraint.activate([
-            // The row now holds tools only, so it hugs its content and centres
-            // rather than stretching the full width.
-            bottomToolbarBackground.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            bottomToolbarBackground.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 12),
-            bottomToolbarBackground.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -12),
-            bottomToolbarBackground.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
+        switch appearance.toolbarStyle {
+        case .circularButtons:
+            // Each button carries its own backing, so the row itself is bare.
+            toolRow.spacing = appearance.toolbarPlacement == .top ? 8 : 12
+            return toolRow
+        case .floatingBar:
+            // Tighter in the top bar, where it shares the width with Cancel.
+            toolRow.spacing = appearance.toolbarPlacement == .top ? 20 : 28
+            let inset: CGFloat = appearance.toolbarPlacement == .top ? 16 : 24
+            toolRow.translatesAutoresizingMaskIntoConstraints = false
+            toolRowBackground.contentView.addSubview(toolRow)
+            NSLayoutConstraint.activate([
+                toolRow.leadingAnchor.constraint(equalTo: toolRowBackground.contentView.leadingAnchor, constant: inset),
+                toolRow.trailingAnchor.constraint(equalTo: toolRowBackground.contentView.trailingAnchor, constant: -inset),
+                toolRow.topAnchor.constraint(equalTo: toolRowBackground.contentView.topAnchor, constant: 12),
+                toolRow.bottomAnchor.constraint(equalTo: toolRowBackground.contentView.bottomAnchor, constant: -12),
+            ])
+            return toolRowBackground
+        }
+    }
 
-            bottomToolbar.leadingAnchor.constraint(equalTo: bottomToolbarBackground.contentView.leadingAnchor, constant: 24),
-            bottomToolbar.trailingAnchor.constraint(equalTo: bottomToolbarBackground.contentView.trailingAnchor, constant: -24),
-            bottomToolbar.topAnchor.constraint(equalTo: bottomToolbarBackground.contentView.topAnchor, constant: 12),
-            bottomToolbar.bottomAnchor.constraint(equalTo: bottomToolbarBackground.contentView.bottomAnchor, constant: -12),
-        ])
+    /// Cancel as a titled bar button, or as an ✕ on a circular backing to match
+    /// ``EditorToolbarStyle/circularButtons``.
+    private func makeCancelButton() -> UIView {
+        switch appearance.toolbarStyle {
+        case .floatingBar:
+            return makeTextButton(L10n.cancel, role: .dismissing, action: #selector(cancelTapped))
+        case .circularButtons:
+            let button = makeSymbolButton(symbol: appearance.symbols[.cancel] ?? "xmark",
+                                          selector: #selector(cancelTapped))
+            button.accessibilityLabel = L10n.cancel
+            appearance.styleToolButton?(button, .cancel)
+            return appearance.makeCircularBacking(for: button)
+        }
     }
 
     private func setupCropChrome() {
@@ -472,6 +683,8 @@ public final class MediaEditorViewController: UIViewController {
 
         // Manual straighten dial, above the aspect bar.
         rotationDial.delegate = self
+        cropOverlay.onAdjustmentBegan = { [weak self] in self?.cropAdjustmentBegan() }
+        cropOverlay.onAdjustmentEnded = { [weak self] in self?.cropAdjustmentEnded() }
         rotationDial.translatesAutoresizingMaskIntoConstraints = false
         rotationDial.isHidden = true
         view.addSubview(rotationDial)
@@ -555,6 +768,10 @@ public final class MediaEditorViewController: UIViewController {
         canvasView.drawingPolicy = .anyInput          // allow finger drawing (and simulator)
         canvasView.backgroundColor = .clear
         canvasView.isOpaque = false
+        // Strokes are drawn straight onto the media, so show their true colours
+        // rather than PencilKit's dark-mode adaptation — the canvas is clear, so
+        // nothing else about it looks light.
+        canvasView.overrideUserInterfaceStyle = .light
         canvasView.alwaysBounceVertical = false
         canvasView.alwaysBounceHorizontal = false
 
@@ -606,9 +823,10 @@ public final class MediaEditorViewController: UIViewController {
         ])
     }
 
-    /// Builds the enabled geometry tool buttons plus undo/redo.
+    /// Builds the enabled tool buttons, each on its circular backing when the
+    /// appearance asks for one.
     private func toolbarButtons() -> [UIView] {
-        var buttons: [UIView] = []
+        var buttons: [UIButton] = []
         let tools = configuration.tools(for: item.kind)
         if tools.contains(.crop) {
             buttons.append(makeToolButton(.crop, selector: #selector(cropTapped)))
@@ -635,11 +853,20 @@ public final class MediaEditorViewController: UIViewController {
             buttons.append(makeToolButton(.addPhoto, selector: #selector(addPhotoTapped)))
         }
         if tools.contains(.audio) {
-            // Stays out of the row until the asset is known to carry audio.
-            audioButton.isHidden = true
             buttons.append(audioButton)
         }
-        return buttons
+        let views: [UIView] = buttons.map { button in
+            let host = appearance.toolbarStyle == .circularButtons
+                ? appearance.makeCircularBacking(for: button)
+                : button
+            if button === audioButton {
+                // Stays out of the row until the asset is known to carry audio.
+                audioButtonHost = host
+                host.isHidden = true
+            }
+            return host
+        }
+        return views
     }
 
     /// A tool-row button for `action`, styled through the appearance so a host
@@ -706,12 +933,61 @@ public final class MediaEditorViewController: UIViewController {
         guard mode == .normal else { return }        // crop/draw modes manage their own image
         guard let source = previewSource, isViewLoaded else { return }
         guard let rendered = renderer.renderGeometry(cgImage: source, recipe: recipe) else { return }
-        var image = UIImage(cgImage: rendered)
-        // Bake the drawing into the preview (overlays stay as live views on top).
-        if let drawing = recipe.drawing {
-            image = drawingCompositor.composite(base: image, drawing: drawing)
+        // The drawing and overlays are live layers on top, not baked in.
+        imageView.image = UIImage(cgImage: rendered)
+        syncOverlayCanvas()
+    }
+
+    /// Where the stickers and the drawing are laid out, in the image view's
+    /// coordinates: over the displayed media. In crop mode that's the whole
+    /// rotated frame, and the edits are carried onto it (see
+    /// `showEditsOverCropPreview`).
+    private func overlayCanvasFrame() -> CGRect {
+        displayedImageFrame()
+    }
+
+    /// Rasterizes the recipe's drawing when it changes, and stacks it where the
+    /// recipe says among the stickers.
+    private func updateDrawingLayer() {
+        showDrawing(recipe.drawing)
+    }
+
+    /// Puts `drawing` on screen, re-rasterizing only when it changed.
+    ///
+    /// Drawn at the authoring canvas size — the media's on-screen size when the
+    /// strokes went down — and stretched with the media from there, as the
+    /// export stretches it to the output size.
+    private func showDrawing(_ drawing: DrawingData?) {
+        overlayContainer.drawingZIndex = drawing?.zIndex ?? .min
+        shownDrawing = drawing
+        rasterizeDrawingIfNeeded()
+    }
+
+    /// Rasterizes the shown drawing at the size it's displayed at — not its
+    /// canvas size, which after a crop can be far smaller (blurry) or, carried
+    /// onto a wider frame, far larger (tens of megabytes) than the screen.
+    private func rasterizeDrawingIfNeeded() {
+        guard let drawing = shownDrawing else {
+            renderedDrawing = nil
+            drawingLayerView.image = nil
+            return
         }
-        imageView.image = image
+        let scale = max(1, traitCollection.displayScale)
+        let frame = overlayContainer.imageFrame.size
+        let points = frame.width > 0 && frame.height > 0
+            ? frame : CGSize(width: drawing.canvasWidth, height: drawing.canvasHeight)
+        let pixels = CGSize(width: (points.width * scale).rounded(), height: (points.height * scale).rounded())
+        guard pixels != renderedDrawingPixels || drawing != renderedDrawing else { return }
+        renderedDrawing = drawing
+        renderedDrawingPixels = pixels
+        drawingLayerView.image = drawingCompositor.strokeImage(for: drawing, outputSize: pixels)
+    }
+
+    /// Lays the stickers and drawing over the displayed media, re-rasterizing
+    /// the drawing if its on-screen size changed.
+    private func syncOverlayCanvas() {
+        overlayContainer.imageFrame = overlayCanvasFrame()
+        rasterizeDrawingIfNeeded()
     }
 
     /// The rect within `imageView.bounds` where the image is actually displayed
@@ -731,7 +1007,33 @@ public final class MediaEditorViewController: UIViewController {
         redoButton.isEnabled = history.canRedo
         undoButton.alpha = history.canUndo ? 1 : 0.35
         redoButton.alpha = history.canRedo ? 1 : 0.35
+        updateHistoryVisibility(animated: isViewLoaded && view.window != nil)
         notifyToolbarStateChanged()
+    }
+
+    /// Undo/redo stay out of sight until there is something to undo or redo,
+    /// and while a tool is open — it has its own Cancel.
+    private func updateHistoryVisibility(animated: Bool) {
+        let show = mode == .normal && (history.canUndo || history.canRedo)
+        let target: CGFloat = show ? 1 : 0
+        guard animated else {
+            historyContainer.layer.removeAllAnimations()
+            historyContainer.alpha = target
+            historyContainer.isHidden = !show
+            return
+        }
+        guard historyContainer.isHidden == show || historyContainer.alpha != target else { return }
+        if show && historyContainer.isHidden {
+            historyContainer.alpha = 0
+            historyContainer.isHidden = false
+        }
+        UIView.animate(withDuration: 0.2, animations: { [weak self] in
+            self?.historyContainer.alpha = target
+        }, completion: { [weak self] _ in
+            // A later call may have brought it back mid-fade.
+            guard let self, historyContainer.alpha == 0 else { return }
+            historyContainer.isHidden = true
+        })
     }
 
     /// Lets a host-supplied tool row refresh itself after any state change.
@@ -740,21 +1042,58 @@ public final class MediaEditorViewController: UIViewController {
         toolbarProvider.updateToolbar(customToolbar, editor: self)
     }
 
-    /// Shows or hides whichever tool row is in play. A custom row can opt out
-    /// of being hidden while a modal tool is open.
+    /// Shows or hides the main-mode chrome along the bottom: whichever tool row
+    /// is in play, the floating Done button and the accessory. A custom row can
+    /// opt out of being hidden while a modal tool is open — though at the top it
+    /// lives in the top bar, which every tool swaps out for its own.
     private func setMainToolbarHidden(_ hidden: Bool) {
+        if hidden { bottomAccessory?.endEditing(true) }     // a tool is taking over the screen
+        updateHistoryVisibility(animated: false)
+        bottomAccessory?.isHidden = hidden
+        floatingDoneButton?.isHidden = hidden
         if let customToolbar {
             guard toolbarProvider?.hidesToolbarInToolMode(customToolbar) ?? true else { return }
             customToolbar.isHidden = hidden
         } else {
-            bottomToolbarBackground.isHidden = hidden
+            toolRowContainer?.isHidden = hidden
         }
     }
 
-    /// The top of the tool row, whichever one is in play — the trim scrubber
-    /// sits above it.
-    private var toolbarTopAnchor: NSLayoutYAxisAnchor {
-        customToolbar?.topAnchor ?? bottomToolbar.topAnchor
+    /// What the video controls stack above — the tool row when it sits at the
+    /// bottom (the buttons themselves, for the glass bar), otherwise the floating
+    /// Done button or the accessory's resting place.
+    private var bottomChromeTopAnchor: NSLayoutYAxisAnchor {
+        if appearance.toolbarPlacement == .bottom, let toolRowContainer {
+            return toolRowContainer === toolRowBackground ? toolRow.topAnchor : toolRowContainer.topAnchor
+        }
+        return floatingDoneButton?.topAnchor ?? bottomChromeGuide.topAnchor
+    }
+
+    // MARK: - Geometry changes
+
+    /// `next`, with `old`'s stickers and drawing moved so they stay on the same
+    /// part of the media under `next`'s flip, rotation and crop — rather than
+    /// riding along with the frame.
+    private func carryingEdits(into next: EditRecipe, from old: EditRecipe) -> EditRecipe {
+        let size = cropSourceSize
+        guard size.width > 0, size.height > 0,
+              next.rotation != old.rotation || next.flip != old.flip || next.crop?.rect != old.crop?.rect
+        else { return next }
+        var carried = next.carryingOverlays(from: old, sourceSize: size)
+        if let drawing = old.drawing {
+            let before = MediaGeometry(recipe: old, sourceSize: size)
+            let after = MediaGeometry(recipe: next, sourceSize: size)
+            carried.drawing = drawingCompositor.carried(drawing, by: before.transform(to: after),
+                                                        from: before.outputSize, to: after.outputSize)
+        }
+        return carried
+    }
+
+    /// Records a flip, rotation or crop, carrying the edits along with the
+    /// media.
+    private func applyGeometry(_ next: EditRecipe) {
+        apply(carryingEdits(into: next, from: recipe))
+        reloadOverlaysFromRecipe()
     }
 
     // MARK: - Crop mode
@@ -772,9 +1111,6 @@ public final class MediaEditorViewController: UIViewController {
         // and filmstrip would collide with the crop chrome.
         if case .video = item {
             setPlaybackChromeHidden(true)
-            // Crop shows the whole uncropped frame; the strokes belong to the
-            // cropped one.
-            videoDrawingView.isHidden = true
         }
 
         // Split the recipe's rotation into a 90° preset base and a straighten
@@ -786,8 +1122,14 @@ public final class MediaEditorViewController: UIViewController {
         cropFlip = recipe.flip
         rotationDial.setDegrees(cropStraighten)
 
+        // The edits stay in view, on the part of the media they belong to, and
+        // step aside only while the user adjusts. They're for looking at only.
         overlayContainer.deselect()
-        overlayContainer.isHidden = true
+        overlayContainer.isUserInteractionEnabled = false
+        // The whole frame is on show; the crop overlay dims what the crop
+        // leaves out, stickers included.
+        overlayContainer.clipsToCanvas = false
+        cropShowsEdits = true
 
         // A fresh crop starts locked to the source's own ratio, so the frame
         // opens on the whole media rather than a freeform rect.
@@ -802,6 +1144,7 @@ public final class MediaEditorViewController: UIViewController {
         } else {
             cropOverlay.reset()
         }
+        showEditsOverCropPreview()
 
         topBar.isHidden = true
         setMainToolbarHidden(true)
@@ -842,6 +1185,7 @@ public final class MediaEditorViewController: UIViewController {
         var geo = EditRecipe()
         geo.rotation = RotationState(degrees: cropTotalDegrees)
         geo.flip = cropFlip
+        geo.filter = recipe.filter          // the look stays; only geometry is being edited
         if let rendered = renderer.renderGeometry(cgImage: source, recipe: geo) {
             imageView.image = UIImage(cgImage: rendered)
         }
@@ -861,35 +1205,97 @@ public final class MediaEditorViewController: UIViewController {
         let aw = bbox.width * CGFloat(frac.width)
         let ah = bbox.height * CGFloat(frac.height)
         cropOverlay.allowedRect = CGRect(x: bbox.midX - aw / 2, y: bbox.midY - ah / 2, width: aw, height: ah)
+        syncOverlayCanvas()
+    }
+
+    /// The user started changing the crop: fade the edits out while the frame
+    /// moves under them. A tap-sized change (rotate, flip, an aspect preset)
+    /// hides them at once, since the frame jumps straight to its new place.
+    private func cropAdjustmentBegan(instant: Bool = false) {
+        guard mode == .crop, cropShowsEdits else { return }
+        cropShowsEdits = false
+        overlayContainer.layer.removeAllAnimations()
+        UIView.animate(withDuration: instant ? 0 : 0.15) { [weak self] in self?.overlayContainer.alpha = 0 }
+    }
+
+    /// The change is done: bring the edits back, still on the same spot of the
+    /// media — turned or mirrored with it if it was, and wherever the crop frame
+    /// now happens to be.
+    private func cropAdjustmentEnded() {
+        guard mode == .crop, !cropShowsEdits else { return }
+        cropShowsEdits = true
+        showEditsOverCropPreview()
+        UIView.animate(withDuration: 0.25) { [weak self] in self?.overlayContainer.alpha = 1 }
+    }
+
+    /// Lays the edits over the crop tool's preview — the whole frame under the
+    /// working rotation and flip — by carrying them from the recipe's geometry.
+    private func showEditsOverCropPreview() {
+        var whole = recipe
+        whole.rotation = RotationState(degrees: cropTotalDegrees)
+        whole.flip = cropFlip
+        whole.crop = nil
+        let shown = carryingEdits(into: whole, from: recipe)
+        syncOverlayCanvas()
+        overlayContainer.reload(overlays: shown.overlays, images: overlayImages)
+        showDrawing(shown.drawing)
+    }
+
+    /// Wraps a one-tap change to the crop — the frame jumps, the edits follow.
+    private func adjustCrop(_ change: () -> Void) {
+        cropAdjustmentBegan(instant: true)
+        change()
+        cropAdjustmentEnded()
     }
 
     @objc private func cropFlipHTapped() {
-        cropFlip.horizontal.toggle()
-        renderCropPreview()
+        adjustCrop {
+            cropFlip.horizontal.toggle()
+            renderCropPreview()
+        }
     }
 
     @objc private func cropFlipVTapped() {
-        cropFlip.vertical.toggle()
-        renderCropPreview()
+        adjustCrop {
+            cropFlip.vertical.toggle()
+            renderCropPreview()
+        }
     }
 
     @objc private func cropRotateTapped() {
-        cropRotationBase += 90            // rotate 90° clockwise
-        renderCropPreview()
-        cropOverlay.reset()
+        adjustCrop {
+            cropRotationBase += 90            // rotate 90° clockwise
+            renderCropPreview()
+            cropOverlay.reset()
+        }
     }
 
     @objc private func applyCropTapped() {
         var next = recipe
-        next.rotation = RotationState(degrees: cropTotalDegrees)
+        // Four quarter turns are no turn at all, not a 360° edit.
+        next.rotation = RotationState(degrees: cropTotalDegrees.truncatingRemainder(dividingBy: 360))
         next.flip = cropFlip
         if cropOverlay.isEffectivelyFull {
             next.crop = nil
         } else {
-            next.crop = CropState(rect: cropOverlay.normalizedCropRect(), aspect: cropOverlay.aspect)
+            let rect = cropOverlay.normalizedCropRect()
+            // Opening crop and applying straight away round-trips the rect
+            // through screen points; keep the recipe's own rather than record
+            // floating-point noise as an edit (and move every sticker for it).
+            if let current = recipe.crop, current.aspect == cropOverlay.aspect,
+               current.rect.isClose(to: rect) {
+                next.crop = current
+            } else {
+                next.crop = CropState(rect: rect, aspect: cropOverlay.aspect)
+            }
         }
-        exitCropMode()
-        apply(next)
+        let changed = next.rendersDifferently(from: recipe)
+        // `applyGeometry` lays the edits out for the new recipe itself.
+        exitCropMode(restoringEdits: false)
+        applyGeometry(next)
+        // An unchanged recipe doesn't re-render, and the preview still shows
+        // the whole uncropped frame from crop mode.
+        if !changed { renderPreview() }
     }
 
     @objc private func cancelCropTapped() {
@@ -898,15 +1304,17 @@ public final class MediaEditorViewController: UIViewController {
     }
 
     @objc private func resetCropTapped() {
-        cropStraighten = 0
-        rotationDial.setDegrees(0)
-        renderCropPreview()
-        cropOverlay.reset()
+        adjustCrop {
+            cropStraighten = 0
+            rotationDial.setDegrees(0)
+            renderCropPreview()
+            cropOverlay.reset()
+        }
     }
 
     @objc private func aspectTapped(_ sender: UIButton) {
         guard let match = aspectButtons.first(where: { $0.button === sender }) else { return }
-        cropOverlay.aspect = match.preset
+        adjustCrop { cropOverlay.aspect = match.preset }
         highlightAspectButton(for: match.preset)
     }
 
@@ -923,16 +1331,27 @@ public final class MediaEditorViewController: UIViewController {
         }
     }
 
-    private func exitCropMode() {
+    /// Leaves crop mode. `restoringEdits` puts the recipe's own sticker and
+    /// drawing layout back; Apply skips it, since it lays them out anew.
+    private func exitCropMode(restoringEdits: Bool = true) {
         mode = .normal
         cropOverlay.removeFromSuperview()
         if case .video = item {
             setPlaybackChromeHidden(false)
-            videoDrawingView.isHidden = false
             // Back to the recipe's own geometry, crop included.
             layoutVideoPreview()
         }
-        overlayContainer.isHidden = false
+        cropShowsEdits = false
+        overlayContainer.layer.removeAllAnimations()
+        overlayContainer.alpha = 1
+        overlayContainer.isUserInteractionEnabled = true
+        overlayContainer.clipsToCanvas = true
+        // Back to the recipe's own layout of the edits.
+        syncOverlayCanvas()
+        if restoringEdits {
+            reloadOverlaysFromRecipe()
+            updateDrawingLayer()
+        }
         topBar.isHidden = false
         setMainToolbarHidden(false)
         cropTopBar.isHidden = true
@@ -956,10 +1375,6 @@ public final class MediaEditorViewController: UIViewController {
         layer.videoGravity = .resize
         videoContainer.clipsToBounds = true
         videoContainer.layer.addSublayer(layer)
-        // Strokes sit above the picture and inside the clip, stretched with it.
-        videoDrawingView.contentMode = .scaleToFill
-        videoDrawingView.isUserInteractionEnabled = false
-        videoContainer.addSubview(videoDrawingView)
         imageView.addSubview(videoContainer)
         self.player = player
         self.playerLayer = layer
@@ -973,7 +1388,7 @@ public final class MediaEditorViewController: UIViewController {
             NSLayoutConstraint.activate([
                 trimScrubber.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
                 trimScrubber.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
-                trimScrubber.bottomAnchor.constraint(equalTo: toolbarTopAnchor, constant: -12),
+                trimScrubber.bottomAnchor.constraint(equalTo: bottomChromeTopAnchor, constant: -12),
                 trimScrubber.heightAnchor.constraint(equalToConstant: 60),
             ])
         }
@@ -1002,7 +1417,7 @@ public final class MediaEditorViewController: UIViewController {
         view.addSubview(timeLabel)
         NSLayoutConstraint.activate([
             timeLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            timeLabel.bottomAnchor.constraint(equalTo: showsTrimScrubber ? trimScrubber.topAnchor : toolbarTopAnchor,
+            timeLabel.bottomAnchor.constraint(equalTo: showsTrimScrubber ? trimScrubber.topAnchor : bottomChromeTopAnchor,
                                               constant: -8),
             timeLabel.heightAnchor.constraint(equalToConstant: 16),
         ])
@@ -1061,25 +1476,7 @@ public final class MediaEditorViewController: UIViewController {
         // Undo/redo can change the trim without the filmstrip being touched, so
         // the handles, loop range and readout have to follow the recipe.
         syncTrimFromRecipe()
-        updateVideoDrawing()
         layoutVideoPreview()
-    }
-
-    /// Rasterizes the recipe's drawing for the video preview when it changes.
-    ///
-    /// Drawn at the authoring canvas size — the frame's on-screen size when the
-    /// strokes went down — and stretched with the frame from there, as the export
-    /// stretches it to the output size.
-    private func updateVideoDrawing() {
-        guard recipe.drawing != renderedVideoDrawing else { return }
-        renderedVideoDrawing = recipe.drawing
-        guard let drawing = recipe.drawing else {
-            videoDrawingView.image = nil
-            return
-        }
-        let scale = max(1, traitCollection.displayScale)
-        let pixels = CGSize(width: drawing.canvasWidth * scale, height: drawing.canvasHeight * scale)
-        videoDrawingView.image = drawingCompositor.strokeImage(for: drawing, outputSize: pixels)
     }
 
     private func syncTrimFromRecipe() {
@@ -1160,7 +1557,7 @@ public final class MediaEditorViewController: UIViewController {
     /// Mirrors `recipe.removeAudio` onto the toggle, and keeps it out of the
     /// toolbar entirely for a source that has no audio to remove.
     private func updateAudioButton() {
-        audioButton.isHidden = !hasAudioTrack
+        (audioButtonHost ?? audioButton).isHidden = !hasAudioTrack
         let muted = recipe.removeAudio
         // The "on" state gets its own glyph; a host overriding the symbol for
         // `.toggleAudio` keeps control of the "off" one.
@@ -1240,7 +1637,6 @@ public final class MediaEditorViewController: UIViewController {
         CATransaction.begin()
         CATransaction.setDisableActions(true)   // geometry tracks the recipe, it isn't an animation
         videoContainer.frame = display
-        videoDrawingView.frame = videoContainer.bounds
         playerLayer.bounds = CGRect(origin: .zero, size: CGSize(width: w * scale, height: h * scale))
         // Centre the rotated frame in the container, offset by the crop origin.
         playerLayer.position = CGPoint(
@@ -1254,7 +1650,7 @@ public final class MediaEditorViewController: UIViewController {
         CATransaction.commit()
 
         alignTransport(to: display)
-        overlayContainer.imageFrame = displayedImageFrame()
+        syncOverlayCanvas()
     }
 
     private func seek(to seconds: Double) {
@@ -1349,36 +1745,34 @@ public final class MediaEditorViewController: UIViewController {
         guard mode == .normal else { return }
         switch item {
         case .photo:
-            guard let source = previewSource else { return }
+            guard previewSource != nil else { return }
             mode = .draw
-            // Show the geometry image only; the canvas renders the strokes itself.
-            if let rendered = renderer.renderGeometry(cgImage: source, recipe: recipe) {
-                imageView.image = UIImage(cgImage: rendered)
-            }
         case .video:
             // No frame on screen yet means no canvas size to author against.
             guard !videoContainer.frame.isEmpty else { return }
             mode = .draw
             setPlaybackChromeHidden(true)
-            videoDrawingView.isHidden = true         // the canvas shows the strokes
         }
 
-        overlayContainer.deselect()
-        overlayContainer.isHidden = true
         topBar.isHidden = true
         setMainToolbarHidden(true)
         drawTopBar.isHidden = false
 
+        // The canvas takes the drawing's place among the stickers — over the
+        // picture ones, under the text — so every other edit stays in view.
         view.layoutIfNeeded()
-        canvasView.frame = view.convert(displayedImageFrame(), from: imageView)
+        overlayContainer.beginDrawing(with: canvasView)
         loadDrawingIntoCanvas()
-        view.addSubview(canvasView)
+        drawingAtEntry = canvasView.drawing
         view.bringSubviewToFront(drawTopBar)
 
         toolPicker.setVisible(true, forFirstResponder: canvasView)
         toolPicker.addObserver(canvasView)
         canvasView.becomeFirstResponder()
     }
+
+    /// The strokes as the pencil tool opened, to tell an edit from a look.
+    private var drawingAtEntry = PKDrawing()
 
     /// Loads the recipe's drawing into the canvas, scaling it from its authoring
     /// canvas to the current canvas size if they differ.
@@ -1403,11 +1797,16 @@ public final class MediaEditorViewController: UIViewController {
         var next = recipe
         if pkDrawing.bounds.isNull || pkDrawing.strokes.isEmpty {
             next.drawing = nil
+        } else if pkDrawing.dataRepresentation() == drawingAtEntry.dataRepresentation() {
+            // Opened and closed without a stroke: leave it where it stacks.
         } else {
+            // Fresh strokes go over every sticker already on the media; anything
+            // added afterwards lands on top of them.
             next.drawing = DrawingData(
                 data: pkDrawing.dataRepresentation(),
                 canvasWidth: Double(size.width),
-                canvasHeight: Double(size.height)
+                canvasHeight: Double(size.height),
+                zIndex: recipe.nextZIndex
             )
         }
         exitDrawingMode()
@@ -1423,13 +1822,11 @@ public final class MediaEditorViewController: UIViewController {
         toolPicker.setVisible(false, forFirstResponder: canvasView)
         toolPicker.removeObserver(canvasView)
         canvasView.resignFirstResponder()
-        canvasView.removeFromSuperview()
+        overlayContainer.endDrawing()
         mode = .normal
         if case .video = item {
             setPlaybackChromeHidden(false)
-            videoDrawingView.isHidden = false
         }
-        overlayContainer.isHidden = false
         topBar.isHidden = false
         setMainToolbarHidden(false)
         drawTopBar.isHidden = true
@@ -1454,18 +1851,14 @@ public final class MediaEditorViewController: UIViewController {
         filterBarBackground.isHidden = false
     }
 
-    /// Preview with the working filter (geometry + filter + drawing; overlays stay
-    /// as live views on top).
+    /// Preview with the working filter (geometry + filter; the drawing and
+    /// overlays stay as live layers on top).
     private func renderFilterPreview() {
         guard let source = previewSource else { return }
         var r = recipe
         r.filter = filterWorkingFilter
         guard let rendered = renderer.renderGeometry(cgImage: source, recipe: r) else { return }
-        var image = UIImage(cgImage: rendered)
-        if let drawing = r.drawing {
-            image = drawingCompositor.composite(base: image, drawing: drawing)
-        }
-        imageView.image = image
+        imageView.image = UIImage(cgImage: rendered)
     }
 
     /// Renders a small thumbnail of the geometry-applied image for each filter.
@@ -1533,7 +1926,11 @@ public final class MediaEditorViewController: UIViewController {
     }
 
     private func presentTextEditor(seed: TextStyle, completion: @escaping (TextStyle) -> Void) {
-        let editor = TextEditorViewController(style: seed, appearance: appearance) { style in
+        // The text editor brings up the keyboard, which would lift the caption
+        // bar into view behind its translucent backdrop.
+        bottomAccessory?.isHidden = true
+        let editor = TextEditorViewController(style: seed, appearance: appearance) { [weak self] style in
+            if let self, mode == .normal { bottomAccessory?.isHidden = false }
             guard let style else { return }
             completion(style)
         }
@@ -1542,7 +1939,8 @@ public final class MediaEditorViewController: UIViewController {
 
     /// Appends a new overlay centered on the canvas, on top of the stack.
     private func insertOverlay(content: OverlayContent, image: UIImage?) {
-        let nextZ = (recipe.overlays.map(\.zIndex).max() ?? -1) + 1
+        // Above everything already placed, the drawing included.
+        let nextZ = recipe.nextZIndex
         if case let .image(ref) = content, let image { overlayImages[ref.id] = image }
         let overlay = Overlay(content: content, transform: .identity, zIndex: nextZ)
         var next = recipe
@@ -1589,19 +1987,19 @@ public final class MediaEditorViewController: UIViewController {
     @objc private func rotateTapped() {
         var next = recipe
         next.rotation.rotateClockwise90()
-        apply(next)
+        applyGeometry(next)
     }
 
     @objc private func flipHTapped() {
         var next = recipe
         next.flip.horizontal.toggle()
-        apply(next)
+        applyGeometry(next)
     }
 
     @objc private func flipVTapped() {
         var next = recipe
         next.flip.vertical.toggle()
-        apply(next)
+        applyGeometry(next)
     }
 
     @objc private func addTextTapped() { addText() }
@@ -1741,6 +2139,29 @@ public final class MediaEditorViewController: UIViewController {
     /// Photos render synchronously through `PhotoRenderer`. Videos export
     /// asynchronously through `VideoComposer` behind a progress panel, with the
     /// drawing and overlays burned in; `onFinish` fires once the file is ready.
+    /// Stacks the edits onto the rendered photo as on screen — the stickers
+    /// under the strokes, the strokes, then the stickers over them — in a
+    /// single full-resolution pass, so a large photo needs one output bitmap
+    /// and one for the strokes rather than one per layer.
+    private func composite(base: UIImage) -> UIImage {
+        guard !recipe.overlays.isEmpty || recipe.drawing != nil else { return base }
+        let canvas = base.size
+        let pixels = CGSize(width: canvas.width * base.scale, height: canvas.height * base.scale)
+        let strokes = recipe.drawing.flatMap { drawingCompositor.strokeImage(for: $0, outputSize: pixels) }
+        let layers = recipe.overlayLayers
+
+        let format = UIGraphicsImageRendererFormat.preferred()
+        format.scale = base.scale
+        format.opaque = false
+        let bounds = CGRect(origin: .zero, size: canvas)
+        return UIGraphicsImageRenderer(size: canvas, format: format).image { context in
+            base.draw(in: bounds)
+            overlayCompositor.draw(layers.belowDrawing, in: context.cgContext, canvas: canvas, images: overlayImages)
+            strokes?.draw(in: bounds)
+            overlayCompositor.draw(layers.aboveDrawing, in: context.cgContext, canvas: canvas, images: overlayImages)
+        }
+    }
+
     public func finish() {
         switch item {
         case .photo:
@@ -1749,11 +2170,7 @@ public final class MediaEditorViewController: UIViewController {
                 onFinish?(.cancelled)
                 return
             }
-            var base = UIImage(cgImage: rendered)
-            if let drawing = recipe.drawing {
-                base = drawingCompositor.composite(base: base, drawing: drawing)
-            }
-            let output = overlayCompositor.composite(base: base, overlays: recipe.overlays, images: overlayImages)
+            let output = composite(base: UIImage(cgImage: rendered))
             onFinish?(.saved(output: .photo(output), recipe: recipe))
         case .video:
             exportVideo()
@@ -1765,6 +2182,9 @@ public final class MediaEditorViewController: UIViewController {
 
 extension MediaEditorViewController: OverlayContainerDelegate {
     func overlayContainerDidCommit(_ container: OverlayContainerView) {
+        // In crop mode the container shows the edits carried onto the whole
+        // frame; a gesture that began before must not write those back.
+        guard mode != .crop else { return }
         var next = recipe
         next.overlays = container.currentOverlays()
         apply(next)
@@ -1774,7 +2194,14 @@ extension MediaEditorViewController: OverlayContainerDelegate {
     /// paused state once the transport has faded out. A tap that merely clears a
     /// sticker selection is left alone, so dismissing a selection doesn't also
     /// stop the video.
+    ///
+    /// While the accessory is being typed into, a tap on the media only puts the
+    /// keyboard away, the way a chat composer behaves.
     func overlayContainer(_ container: OverlayContainerView, didTapCanvasWithSelection hadSelection: Bool) {
+        if let bottomAccessory, bottomAccessory.containsFirstResponder {
+            bottomAccessory.endEditing(true)
+            return
+        }
         guard case .video = item, mode == .normal, !hadSelection else { return }
         togglePlayback()
     }
@@ -1802,6 +2229,13 @@ extension MediaEditorViewController: OverlayContainerDelegate {
     }
 }
 
+private extension UIView {
+    /// Whether this view or anything inside it holds the keyboard.
+    var containsFirstResponder: Bool {
+        isFirstResponder || subviews.contains { $0.containsFirstResponder }
+    }
+}
+
 // MARK: - Filter bar delegate
 
 extension MediaEditorViewController: FilterBarDelegate {
@@ -1815,12 +2249,14 @@ extension MediaEditorViewController: FilterBarDelegate {
 
 extension MediaEditorViewController: RotationDialDelegate {
     func rotationDial(_ dial: RotationDialView, didChangeTo degrees: Double) {
+        cropAdjustmentBegan()
         cropStraighten = degrees
         renderCropPreview()
         cropOverlay.reset()   // keep the frame filling the clean inscribed area
     }
 
     func rotationDialDidCommit(_ dial: RotationDialView) {
+        cropAdjustmentEnded()
         // The angle is committed to the recipe on Apply.
     }
 }

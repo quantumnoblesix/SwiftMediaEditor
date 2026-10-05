@@ -46,6 +46,7 @@ three.
 - ``FlipState``
 - ``TrimRange``
 - ``CropGeometry``
+- ``MediaGeometry``
 - ``NormalizedPoint``
 - ``NormalizedSize``
 - ``NormalizedRect``
