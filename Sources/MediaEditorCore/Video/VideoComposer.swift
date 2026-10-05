@@ -8,6 +8,7 @@
 //
 
 import AVFoundation
+import os
 import CoreGraphics
 
 /// Builds AVFoundation compositions that realize an `EditRecipe` for video:
@@ -255,8 +256,22 @@ public struct VideoComposer: Sendable {
         }
         defer { progressTask.cancel() }
 
+        // Cancellation can land before the export starts — the user cancels the
+        // moment it begins. `cancelExport()` on a session that hasn't started,
+        // followed by starting it, makes AVFoundation throw an Objective-C
+        // exception, so the two sides agree under a lock on who goes first.
+        let state = OSAllocatedUnfairLock(initialState: ExportStart.pending)
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                let start = state.withLock { phase -> Bool in
+                    guard phase == .pending else { return false }
+                    phase = .started
+                    return true
+                }
+                guard start else {
+                    cont.resume(throwing: CancellationError())
+                    return
+                }
                 box.value.exportAsynchronously {
                     switch box.value.status {
                     case .completed:
@@ -270,10 +285,17 @@ public struct VideoComposer: Sendable {
                 }
             }
         } onCancel: {
-            box.value.cancelExport()
+            let started = state.withLock { phase -> Bool in
+                if phase == .pending { phase = .cancelled }
+                return phase == .started
+            }
+            if started { box.value.cancelExport() }
         }
         onProgress?(1)
     }
+
+    /// Whether an export session has been started, or cancelled before it was.
+    private enum ExportStart: Sendable { case pending, started, cancelled }
 
     /// Resolves a configuration preset to an `AVAssetExportSession` preset name.
     public func exportPresetName(for preset: VideoExportPreset) -> String {

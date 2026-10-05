@@ -6,6 +6,68 @@ All notable changes to this package are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-05
+
+### Added
+
+#### Multi-item sessions
+
+- `MediaEditorViewController(items:selectedItemID:…)` and
+  `MediaEditorView(items:selection:…)` edit several photos and videos as one
+  session — the pre-send screen of a chat app. A thumbnail strip above the
+  bottom accessory moves between them; each item keeps its own edits and undo
+  history. The strip's cells show each item's current edits, and a video's
+  trimmed duration.
+- `MediaEditorItem` and `MediaSource`: a session's items can be decoded photos,
+  photo files (decoded at full size only while selected), videos, or
+  passthrough content the editor can't edit — a GIF, a document — shown with
+  the host's own view and no tools.
+- `select(_:)`, `remove(_:)`, `insert(_:at:)`, and `onSelectionChange`,
+  `onItemsChange`, `onRecipeChange` and `onAddItems` on the editor; the SwiftUI
+  view keeps its `items` and `selection` bindings in step both ways. Removing
+  the last item ends the session with `.cancelled`.
+- In the strip, tapping the selected thumbnail arms it and a second tap removes
+  the item; an optional "+" cell asks the host for more; long-press-and-drag
+  reorders when `EditorAppearance.allowsReordering` is on; VoiceOver gets
+  custom actions for all of it. A swipe on empty canvas pages between items
+  (`allowsSwipeBetweenItems`).
+- `EditorAppearance` strip options: `thumbnailSize`, `thumbnailCornerRadius`,
+  `thumbnailSpacing`, `thumbnailStripBackground` (none by default),
+  `hidesThumbnailStripWithKeyboard`, `allowsReordering`,
+  `allowsSwipeBetweenItems` and `styleThumbnailCell`.
+- `EditorConfiguration.finishMode`: `.render` renders every edited item behind
+  the progress panel ("Exporting 2 of 5"); `.recipesOnly` hands back the
+  recipes at once, for the host to render after closing the screen. A session
+  ends with `MediaEditorSessionResult`, one `MediaEditorItemResult` per item.
+- `MediaEditorProxy` gains `recipe`, `isToolActive`, `items`,
+  `selectedItemID`, `select(_:)` and `remove(_:)`; the editor gains
+  `isToolActive` and `tearDown()`.
+
+#### Rendering without the editor
+
+- `EditRenderer` renders `media + recipe` exactly as the editor's own save does
+  — the editor now goes through it — for sending in the background, re-rendering
+  a stored recipe, or drawing thumbnails: `renderPhoto`, `exportVideo`,
+  `render(_:)` and `thumbnail(for:maxPixelSize:)`. Decoding and the Core Image
+  pass run off the main actor; thumbnails never touch source resolution. An
+  optional image resolver supplies sticker pictures stored by id alone, and
+  failures throw `EditRenderer.RenderError`, distinct from cancellation.
+
+### Changed
+
+- While the keyboard is up, the space reserved for the bottom accessory holds
+  still: a bar that grows as the user types draws over the media instead of
+  shrinking it.
+
+### Fixed
+
+- Cancelling a video export the moment it starts no longer crashes with an
+  AVFoundation exception.
+- An editor dismissed or swapped out — say, by SwiftUI — pauses its video, and
+  `MediaEditorView` tears it down, cancelling any export, instead of leaving
+  playback running until it deallocated.
+- A large photo can no longer squash a bottom accessory sized by its content.
+
 ## [1.1.0] - 2026-10-05
 
 ### Added
@@ -160,6 +222,7 @@ The first public release.
 - On native macOS only `MediaEditorCore` is available; the editor UI runs on the
   Mac through Mac Catalyst.
 
-[Unreleased]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.1.0...HEAD
+[Unreleased]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.2.0...HEAD
+[1.2.0]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.1.0...1.2.0
 [1.1.0]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.0.0...1.1.0
 [1.0.0]: https://github.com/quantumnoblesix/SwiftMediaEditor/releases/tag/1.0.0
