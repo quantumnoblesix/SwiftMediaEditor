@@ -22,6 +22,11 @@ import MediaEditorCore
 /// a previously-saved `EditRecipe` to resume), and receive an `EditorResult`
 /// through `onFinish`.
 ///
+/// Or hand it several items — ``init(items:selectedItemID:configuration:appearance:toolbarProvider:bottomAccessory:onFinish:)``
+/// — and it edits them as one session: a thumbnail strip moves between them,
+/// each keeps its own edits and undo history, and the session ends with one
+/// result per item.
+///
 /// Photos get the geometry tools (crop / rotate / flip) with a live preview
 /// driven by the non-destructive `EditRecipe` + `PhotoRenderer`, plus filters,
 /// drawing, overlays, undo/redo, and save. Videos get the crop tool, drawing and
@@ -30,12 +35,75 @@ import MediaEditorCore
 @MainActor
 public final class MediaEditorViewController: UIViewController {
 
-    /// The media being edited.
-    public let item: MediaItem
+    /// The media being edited — in a multi-item session, the selected item's.
+    /// A file-backed photo appears here once decoded; passthrough content has
+    /// no editable media, so look at ``selectedItem`` for that.
+    public private(set) var item: MediaItem
     /// Editor configuration (enabled tools, aspect presets, export settings).
     public let configuration: EditorConfiguration
-    /// Called once when the session ends, on the main actor.
+    /// Called once when a single-item editor ends, on the main actor.
     public var onFinish: ((EditorResult) -> Void)?
+    /// Called once when a multi-item session ends, on the main actor.
+    public var onSessionFinish: ((MediaEditorSessionResult) -> Void)?
+
+    // MARK: Session
+
+    /// The session's items in strip order, with their current recipes. The
+    /// selected item's recipe is its committed working recipe — never the
+    /// half-applied state of an open tool.
+    public private(set) var items: [MediaEditorItem]
+    /// The item on the canvas.
+    public private(set) var selectedItemID: UUID
+    /// The item on the canvas, with its current recipe.
+    public var selectedItem: MediaEditorItem { items[selectedIndex] }
+
+    /// Called after the selection changes — a strip tap, a page turn, a removal or
+    /// `select(_:)`.
+    public var onSelectionChange: ((UUID) -> Void)?
+    /// Called after items are removed, reordered or inserted.
+    public var onItemsChange: (([MediaEditorItem]) -> Void)?
+    /// Called after every committed change to the selected item's recipe —
+    /// an applied tool, a sticker moved, undo or redo — but not for the recipe
+    /// an item starts with.
+    public var onRecipeChange: ((UUID, EditRecipe) -> Void)?
+    /// When set, the strip ends with a "+" cell that calls this, and stays on
+    /// screen even for one item. Present your own picker and call
+    /// `insert(_:at:)` with what the user picks.
+    public var onAddItems: (() -> Void)? {
+        didSet { if isViewLoaded { updateStrip() } }
+    }
+
+    /// A single-item editor: no strip, and it reports through `onFinish`.
+    private let isSingleItemEditor: Bool
+    private var selectedIndex: Int { items.firstIndex { $0.id == selectedItemID } ?? 0 }
+    /// Undo histories of the items that aren't selected, kept for the session.
+    private var histories: [UUID: EditHistory<EditRecipe>] = [:]
+    /// Set while an item is being loaded, so restoring its recipe isn't
+    /// reported as a change.
+    private var isLoadingSelection = false
+    /// The selected item can't be edited — its own view is on the canvas.
+    private var isPassthrough = false
+    private let passthroughHost = UIView()
+    private var passthroughView: UIView?
+    /// Decodes a file-backed photo off the main actor.
+    private var photoLoadTask: Task<Void, Never>?
+    /// Loads the selected video's duration, tracks and size.
+    private var videoLoadTask: Task<Void, Never>?
+    private lazy var thumbnailStrip = ThumbnailStripView(appearance: appearance)
+    /// Renders strip thumbnails one at a time.
+    private var thumbnailTask: Task<Void, Never>?
+    private var thumbnailQueue: [UUID] = []
+    /// The recipe each strip thumbnail was rendered for.
+    private var thumbnailRecipes: [UUID: EditRecipe] = [:]
+    private var thumbnailDebounce: Task<Void, Never>?
+    /// The page turn in progress, if any.
+    private var paging: Paging?
+    /// Screen-sized renders of the selected item's neighbours, so a page turn
+    /// slides in a sharp picture rather than a stretched strip thumbnail.
+    private var pagePreviews: [UUID: (recipe: EditRecipe, image: UIImage)] = [:]
+    private var pagePreviewTask: Task<Void, Never>?
+    /// The rendering path shared with `EditRenderer`'s hosts.
+    private lazy var editRenderer = EditRenderer(configuration: configuration)
 
     /// How the built-in chrome is styled. Set through `init`; changing it after
     /// the view loads has no effect on bars already built.
@@ -46,17 +114,33 @@ public final class MediaEditorViewController: UIViewController {
     /// `perform(_:)`. See ``MediaEditorToolbarProviding``.
     public private(set) weak var toolbarProvider: (any MediaEditorToolbarProviding)?
 
+    /// A host-supplied bar pinned under everything else — a caption field and a
+    /// send button, say. It spans the full width, sizes itself, and rides up
+    /// with the keyboard. See ``init(item:recipe:configuration:appearance:toolbarProvider:bottomAccessory:onFinish:)``.
+    public let bottomAccessory: UIView?
+
+    /// Whether the editor draws its own Done button. A bottom accessory takes
+    /// that job over — its send button calls `finish()` — so the editor drops
+    /// its own rather than offering two ways to confirm.
+    public var showsDoneButton: Bool { bottomAccessory == nil }
+
     /// Undo/redo history over the working recipe.
     private var history: EditHistory<EditRecipe>
 
-    /// The current working recipe.
+    /// The current working recipe — the selected item's.
     public private(set) var recipe: EditRecipe {
         didSet {
             // Overlays are live views over the render, so an overlay-only edit
             // (dragging a sticker) needs no new bitmap at all.
             if recipe.rendersDifferently(from: oldValue) { renderPreview() }
+            if isViewLoaded { updateDrawingLayer() }
             if case .video = item, isViewLoaded {
                 syncVideoState()
+            }
+            if recipe != oldValue, !isLoadingSelection, items.indices.contains(selectedIndex) {
+                items[selectedIndex].recipe = recipe
+                onRecipeChange?(selectedItemID, recipe)
+                scheduleThumbnailRefresh(for: selectedItemID)
             }
         }
     }
@@ -64,10 +148,9 @@ public final class MediaEditorViewController: UIViewController {
     // MARK: - Rendering
 
     private let renderer = PhotoRenderer()
-    private let overlayCompositor = OverlayCompositor()
     private let drawingCompositor = DrawingCompositor()
     /// The orientation-normalized source image (photos only).
-    private let sourceImage: UIImage?
+    private var sourceImage: UIImage?
     private var sourceCGImage: CGImage?
     /// `sourceCGImage` scaled down to roughly what the preview can actually
     /// show, and the cap it was built for.
@@ -92,6 +175,14 @@ public final class MediaEditorViewController: UIViewController {
         let v = UIImageView()
         v.contentMode = .scaleAspectFit
         v.translatesAutoresizingMaskIntoConstraints = false
+        // The preview fills whatever the chrome leaves. Left at their defaults,
+        // an image view's priorities let a large image — a full-size decode is
+        // thousands of points tall — out-bid the bottom accessory's own
+        // intrinsic height, and Auto Layout squashes the accessory instead.
+        for axis in [NSLayoutConstraint.Axis.horizontal, .vertical] {
+            v.setContentHuggingPriority(.init(1), for: axis)
+            v.setContentCompressionResistancePriority(.init(1), for: axis)
+        }
         return v
     }()
 
@@ -99,14 +190,18 @@ public final class MediaEditorViewController: UIViewController {
     private var playerLayer: AVPlayerLayer?
     /// Clips the player layer to the recipe's crop; sized to the rendered output.
     private let videoContainer = UIView()
-    /// The recipe's drawing over the playing video, inside the crop clip. Photos
-    /// bake strokes into the preview bitmap; a video has no bitmap to bake into.
-    /// Internal so tests can check it.
-    let videoDrawingView = UIImageView()
-    /// The drawing `videoDrawingView` shows, so recipe changes that leave the
+    /// The recipe's strokes on screen, for photos and videos alike. They live in
+    /// the sticker layer rather than the preview bitmap, so they stack among the
+    /// stickers exactly as the export stacks them. Internal so tests can check it.
+    var drawingLayerView: UIImageView { overlayContainer.drawingView }
+    /// The drawing `drawingLayerView` shows, so recipe changes that leave the
     /// strokes alone don't re-rasterize them.
-    private var renderedVideoDrawing: DrawingData?
-    private let videoArtworkRenderer = VideoArtworkRenderer()
+    private var renderedDrawing: DrawingData?
+    /// The pixel size `renderedDrawing` was rasterized at.
+    private var renderedDrawingPixels: CGSize = .zero
+    /// The drawing on screen — the recipe's, or in crop mode its whole-frame
+    /// carry.
+    private var shownDrawing: DrawingData?
     /// The video's oriented display size, resolved once the asset loads.
     /// Internal so tests can stand in for a real asset.
     var videoOrientedSize: CGSize = .zero
@@ -116,7 +211,6 @@ public final class MediaEditorViewController: UIViewController {
     }
 
     // Video editing state.
-    private let composer = VideoComposer()
     private var videoAsset: AVURLAsset?
     private lazy var trimScrubber = TrimScrubberView(appearance: appearance)
     private var displayLink: CADisplayLink?
@@ -146,11 +240,42 @@ public final class MediaEditorViewController: UIViewController {
     private let topBar = UIStackView()
     private let historyBar = UIStackView()
     private lazy var historyBarBackground = appearance.makeBarBackground(cornerRadius: 13)
-    private let bottomToolbar = UIStackView()
-    
-    private lazy var bottomToolbarBackground = appearance.makeBarBackground(cornerRadius: appearance.toolbarCornerRadius)
+    /// What went into the layout for undo/redo: the glass pill, or — under
+    /// ``EditorToolbarStyle/circularButtons`` — the bare row of circles.
+    private var historyContainer: UIView = UIView()
+    /// The built-in tool buttons, laid out in a row.
+    private let toolRow = UIStackView()
+    private lazy var toolRowBackground = appearance.makeBarBackground(cornerRadius: appearance.toolbarCornerRadius)
     /// A host-supplied tool row, when `toolbarProvider` returned one.
     private var customToolbar: UIView?
+    /// Whatever went into the layout for the tool row — the custom row, the
+    /// glass bar, or the bare row of circular buttons.
+    private var toolRowContainer: UIView?
+    /// The Done button, when `toolbarPlacement` is `.top` and pushes it down to
+    /// the bottom trailing corner.
+    private var floatingDoneButton: UIButton?
+    /// Everything reserved along the bottom: the accessory's resting height
+    /// and, above it, the thumbnail strip. The accessory itself follows the
+    /// keyboard; the preview and video controls lay out against this instead,
+    /// so they stay put while the user types.
+    private let bottomChromeGuide = UILayoutGuide()
+    /// The accessory's share of `bottomChromeGuide`.
+    private let accessoryGuide = UILayoutGuide()
+    /// The strip's share of `bottomChromeGuide`, directly above the accessory.
+    private let stripGuide = UILayoutGuide()
+    private var stripHeightConstraint: NSLayoutConstraint?
+    /// Tracks the accessory's content height while the keyboard is down…
+    private var accessoryLiveHeight: NSLayoutConstraint?
+    /// …and holds it while the keyboard is up, so a bar that grows as the user
+    /// types — more caption lines, a list of suggestions — draws over the media
+    /// instead of shrinking it, and nothing behind it jumps or re-renders.
+    private var accessoryFrozenHeight: NSLayoutConstraint?
+    private var isKeyboardUp = false
+    /// Whether the session shows its strip at all: two or more items, or a "+"
+    /// cell to reach.
+    private var stripIsInUse = false
+    /// A tool (crop, drawing, filters) has the screen.
+    private var isToolOpen = false
 
     // Overlay (sticker) layer, above the image preview.
     private let overlayContainer = OverlayContainerView()
@@ -165,6 +290,11 @@ public final class MediaEditorViewController: UIViewController {
     private let cropAspectScroll = UIScrollView()
     private lazy var cropAspectBarBackground = appearance.makeBarBackground(cornerRadius: 24)
     private var aspectButtons: [(preset: AspectPreset, button: UIButton)] = []
+
+    /// Whether crop mode is showing the stickers and drawing over the frame
+    /// they belong to. They step aside while the user moves the frame, rotates
+    /// or straightens, and come back laid over the new frame once they let go.
+    private var cropShowsEdits = false
 
     // Crop-mode geometry state (folded into the recipe on apply).
     private var cropRotationBase: Double = 0           // 90° preset steps
@@ -187,10 +317,19 @@ public final class MediaEditorViewController: UIViewController {
     private var filterWorkingFilter: PhotoFilter = .none
 
     private lazy var undoButton = makeToolButton(.undo, selector: #selector(undoTapped),
-                                                 pointSize: appearance.historySymbolPointSize)
+                                                 pointSize: historySymbolPointSize)
     private lazy var redoButton = makeToolButton(.redo, selector: #selector(redoTapped),
-                                                 pointSize: appearance.historySymbolPointSize)
+                                                 pointSize: historySymbolPointSize)
+    /// Undo/redo glyphs match the tool row's when they get circles of their
+    /// own; on the shared pill they stay smaller.
+    private var historySymbolPointSize: CGFloat {
+        appearance.toolbarStyle == .circularButtons ? appearance.toolSymbolPointSize
+                                                     : appearance.historySymbolPointSize
+    }
     private lazy var audioButton = makeToolButton(.toggleAudio, selector: #selector(toggleAudioTapped))
+    /// What to hide to take the audio toggle out of the row — its circular
+    /// backing under that style, otherwise the button itself.
+    private var audioButtonHost: UIView?
 
     // MARK: - Init
 
@@ -201,44 +340,117 @@ public final class MediaEditorViewController: UIViewController {
     ///   - appearance: how the built-in chrome is styled.
     ///   - toolbarProvider: supplies a replacement tool row, or `nil` for the
     ///     built-in one. Held weakly — keep your own reference to it.
+    ///   - bottomAccessory: a bar the host owns, pinned full-width to the
+    ///     bottom edge and lifted by the keyboard — typically a caption field and
+    ///     a send button. Its background runs under the home indicator, so lay
+    ///     its content out against its `safeAreaLayoutGuide` (or its layout
+    ///     margins) and let the height follow. Call `finish()` from its send
+    ///     action: with an accessory installed the editor shows no Done button of
+    ///     its own. It is hidden while a tool (crop, drawing, filters) is open.
     ///   - onFinish: completion handler delivering the result.
-    public init(
+    public convenience init(
         item: MediaItem,
         recipe: EditRecipe = .identity,
         configuration: EditorConfiguration = .default,
         appearance: EditorAppearance = .default,
         toolbarProvider: (any MediaEditorToolbarProviding)? = nil,
+        bottomAccessory: UIView? = nil,
         onFinish: ((EditorResult) -> Void)? = nil
     ) {
-        self.item = item
+        self.init(items: [MediaEditorItem(source: MediaSource(item), recipe: recipe)], selectedItemID: nil,
+                  configuration: configuration, appearance: appearance, toolbarProvider: toolbarProvider,
+                  bottomAccessory: bottomAccessory, isSingleItemEditor: true)
+        self.onFinish = onFinish
+    }
+
+    /// Edits several items as one session — say, the photos and videos picked
+    /// for a chat message. A thumbnail strip moves between them; each keeps its
+    /// own edits and undo history.
+    ///
+    /// Confirming renders every edited item, or with
+    /// `EditorConfiguration.finishMode` set to `.recipesOnly` hands back the
+    /// recipes straight away for the host to render later with
+    /// ``EditRenderer``. Removing the last item ends the session with
+    /// `.cancelled`.
+    ///
+    /// - Parameters:
+    ///   - items: what to edit, in strip order. Must not be empty.
+    ///   - selectedItemID: the item shown first; `nil` for the first one.
+    ///   - configuration: enabled tools, export settings and the finish mode.
+    ///   - appearance: how the chrome and the strip are styled.
+    ///   - toolbarProvider: supplies a replacement tool row; it's offered the
+    ///     actions of every kind of media in the session and should reflect
+    ///     `isEnabled(_:)` for the selected one.
+    ///   - bottomAccessory: a bar the host owns, as for the single-item editor.
+    ///     The strip sits directly above it.
+    ///   - onFinish: called once with the session's result.
+    public convenience init(
+        items: [MediaEditorItem],
+        selectedItemID: UUID? = nil,
+        configuration: EditorConfiguration = .default,
+        appearance: EditorAppearance = .default,
+        toolbarProvider: (any MediaEditorToolbarProviding)? = nil,
+        bottomAccessory: UIView? = nil,
+        onFinish: ((MediaEditorSessionResult) -> Void)? = nil
+    ) {
+        self.init(items: items, selectedItemID: selectedItemID, configuration: configuration,
+                  appearance: appearance, toolbarProvider: toolbarProvider,
+                  bottomAccessory: bottomAccessory, isSingleItemEditor: false)
+        self.onSessionFinish = onFinish
+    }
+
+    private init(
+        items: [MediaEditorItem],
+        selectedItemID: UUID?,
+        configuration: EditorConfiguration,
+        appearance: EditorAppearance,
+        toolbarProvider: (any MediaEditorToolbarProviding)?,
+        bottomAccessory: UIView?,
+        isSingleItemEditor: Bool
+    ) {
+        precondition(!items.isEmpty, "A media editor session needs at least one item.")
+        let selected = items.first { $0.id == selectedItemID } ?? items[0]
+        self.items = items
+        self.selectedItemID = selected.id
+        self.isSingleItemEditor = isSingleItemEditor
+        self.item = .photo(UIImage())                 // replaced by `prepareSelectedMedia`
         self.configuration = configuration
         self.appearance = appearance
         self.toolbarProvider = toolbarProvider
-        self.recipe = recipe
-        self.history = EditHistory(initial: recipe, limit: configuration.historyLimit)
-        if case let .photo(image) = item {
-            let normalized = image.normalizedUp()
-            self.sourceImage = normalized
-            self.sourceCGImage = normalized.cgImage
-        } else {
-            self.sourceImage = nil
-            self.sourceCGImage = nil
-        }
+        self.bottomAccessory = bottomAccessory
+        self.recipe = selected.recipe
+        self.history = EditHistory(initial: selected.recipe, limit: configuration.historyLimit)
         super.init(nibName: nil, bundle: nil)
         modalPresentationStyle = .fullScreen
-        // Restore image-overlay content from a resumed recipe.
-        for overlay in recipe.overlays {
-            if case let .image(ref) = overlay.content, let data = ref.data,
-               let image = UIImage(data: data) {
-                overlayImages[ref.id] = image
-            }
-        }
+        // The editor is dark whatever the system setting — media reads best on
+        // black, and the chrome is designed for it. The override flows down to
+        // the host's accessory and toolbar, and `present` extends it to sheets.
+        overrideUserInterfaceStyle = .dark
+        // The tool palette floats in its own window, out of the override's reach.
+        toolPicker.overrideUserInterfaceStyle = .dark
+        // …but its swatches show ink as it will really come out. In dark mode
+        // PencilKit would otherwise adapt them (black shown as white), and the
+        // user would pick a colour the result doesn't have.
+        toolPicker.colorUserInterfaceStyle = .light
+        prepareSelectedMedia()
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     // MARK: - Lifecycle
+
+    public override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
+
+    /// Keeps whatever the editor presents — the text editor, the photo picker,
+    /// an alert — as dark as the editor itself. A modal gets its traits from the
+    /// window rather than from the presenter, so the override doesn't reach it
+    /// on its own.
+    public override func present(_ viewControllerToPresent: UIViewController, animated flag: Bool,
+                                 completion: (() -> Void)? = nil) {
+        viewControllerToPresent.overrideUserInterfaceStyle = .dark
+        super.present(viewControllerToPresent, animated: flag, completion: completion)
+    }
 
     public override func viewDidLoad() {
         super.viewDidLoad()
@@ -248,10 +460,14 @@ public final class MediaEditorViewController: UIViewController {
         setupDrawChrome()
         setupFilterChrome()
         setupPreview()
+        setupStrip()
         liftChromeAbovePreview()
         renderPreview()
         overlayContainer.reload(overlays: recipe.overlays, images: overlayImages)
+        updateDrawingLayer()
         updateHistoryButtons()
+        updateHistoryVisibility(animated: false)
+        refreshMainChrome()
         // Icon buttons show in the large content viewer at accessibility text
         // sizes; the interaction has to live on an ancestor.
         view.addInteraction(UILargeContentViewerInteraction())
@@ -260,25 +476,37 @@ public final class MediaEditorViewController: UIViewController {
                                                object: nil)
     }
 
+    public override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        // Leaving the screen shouldn't leave a video playing behind it. Only
+        // pause: a host that pops back to the editor finds it as it was.
+        player?.pause()
+        syncTransport(animated: false)
+        if mode == .draw { toolPicker.setVisible(false, forFirstResponder: canvasView) }
+    }
+
     public override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         if refreshPreviewSourceIfNeeded(), mode == .normal { renderPreview() }
         layoutVideoPreview()
         // Container shares the image view's frame, so the displayed-image rect
         // (in image-view bounds coordinates) maps directly to container bounds.
-        overlayContainer.frame = imageView.frame
-        overlayContainer.imageFrame = displayedImageFrame()
-        overlayContainer.preferredTrashCenter = trashCenterAboveBottomControls()
+        // Bounds and centre rather than frame: while zoomed both views carry
+        // the same transform, and a frame would be the zoomed outline.
+        overlayContainer.bounds = imageView.bounds
+        overlayContainer.center = imageView.center
+        syncOverlayCanvas()
         if mode == .crop {
             positionCropOverlay()
-        }
-        if mode == .draw {
-            canvasView.frame = view.convert(displayedImageFrame(), from: imageView)
         }
     }
 
     public override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        if mode == .draw {
+            toolPicker.setVisible(true, forFirstResponder: canvasView)
+            canvasView.becomeFirstResponder()
+        }
         // UI-test / demo affordance: auto-enter crop for screenshotting. Inert
         // unless the host launches with this argument.
         if ProcessInfo.processInfo.arguments.contains("-MEStartInCrop"),
@@ -319,17 +547,52 @@ public final class MediaEditorViewController: UIViewController {
             imageView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
             imageView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
             imageView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 56),
-            imageView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -88),
+            previewBottomConstraint(),
+        ])
+
+        // Passthrough content — a GIF, a document — fills the preview area in
+        // place of the image.
+        passthroughHost.translatesAutoresizingMaskIntoConstraints = false
+        passthroughHost.isHidden = true
+        view.addSubview(passthroughHost)
+        NSLayoutConstraint.activate([
+            passthroughHost.leadingAnchor.constraint(equalTo: imageView.leadingAnchor),
+            passthroughHost.trailingAnchor.constraint(equalTo: imageView.trailingAnchor),
+            passthroughHost.topAnchor.constraint(equalTo: imageView.topAnchor),
+            passthroughHost.bottomAnchor.constraint(equalTo: imageView.bottomAnchor),
         ])
 
         // Sticker layer floats over the image; positioned in layout passes.
         overlayContainer.delegate = self
         overlayContainer.appearance = appearance
+        // Asked at drag time rather than stored at layout: the accessory's
+        // height can settle after the first pass, and the keyboard moves it.
+        overlayContainer.trashCenterProvider = { [weak self] in self?.trashCenterAboveBottomControls() }
         overlayContainer.clipsToBounds = false
         view.addSubview(overlayContainer)
 
-        if case let .video(url) = item {
-            setupVideo(url: url)
+        overlayContainer.onCanvasPan = { [weak self] pan in self?.handleCanvasPan(pan) }
+        overlayContainer.onCanvasPinch = { [weak self] pinch in self?.handleCanvasPinch(pinch) }
+        overlayContainer.onCanvasDoubleTap = { [weak self] location in self?.handleCanvasDoubleTap(at: location) }
+        if allowsPaging {
+            passthroughHost.addGestureRecognizer(
+                PagingPanGestureRecognizer(target: self, action: #selector(handlePagingPan(_:))))
+        }
+        updateCanvasPan()
+
+        loadSelectedMediaViews()
+    }
+
+    /// Where the preview stops. Under a bottom tool row it leaves the row's
+    /// height plus breathing room; with the row at the top it only has to clear
+    /// the floating Done button or the accessory.
+    private func previewBottomConstraint() -> NSLayoutConstraint {
+        switch appearance.toolbarPlacement {
+        case .bottom:
+            return imageView.bottomAnchor.constraint(equalTo: bottomChromeGuide.topAnchor, constant: -88)
+        case .top:
+            let anchor = floatingDoneButton?.topAnchor ?? bottomChromeGuide.topAnchor
+            return imageView.bottomAnchor.constraint(equalTo: anchor, constant: -16)
         }
     }
 
@@ -337,54 +600,60 @@ public final class MediaEditorViewController: UIViewController {
     /// sticker layer claims every touch inside the preview rect. The history
     /// pill sits just below the top bar — i.e. *inside* that rect — so the
     /// chrome has to be lifted back above it or its buttons never see a tap.
+    ///
+    /// The accessory goes last: the keyboard lifts it over the preview and the
+    /// video controls, and it has to stay on top of both while it does.
     private func liftChromeAbovePreview() {
         view.bringSubviewToFront(topBar)
-        view.bringSubviewToFront(historyBarBackground)
-        if let customToolbar {
-            view.bringSubviewToFront(customToolbar)
-        } else {
-            view.bringSubviewToFront(bottomToolbarBackground)
+        view.bringSubviewToFront(historyContainer)
+        let strip: UIView? = isSingleItemEditor ? nil : thumbnailStrip
+        for chrome in [toolRowContainer, floatingDoneButton, strip, bottomAccessory] {
+            if let chrome, chrome.superview === view { view.bringSubviewToFront(chrome) }
         }
     }
 
-    /// Where the sticker delete bin goes: centred just above the bottom controls
-    /// — for a video the time readout on top of them, otherwise the tool row —
-    /// which is close to where the thumb already is.
+    /// Where the sticker delete bin goes: centred just above the highest control
+    /// along the bottom — the video's time readout or filmstrip, the tool row,
+    /// the floating Done button, the accessory — which is close to where the
+    /// thumb already is.
     ///
-    /// It has to clear that control rather than tuck beneath it: the controls are
-    /// layered above the sticker layer the bin lives in. The gap leaves room for
-    /// the bin's armed swell, spring overshoot included.
+    /// It has to clear all of them rather than tuck beneath one: they are
+    /// layered above the sticker layer the bin lives in, and with a bottom tool
+    /// row stacked on an accessory, or the keyboard lifting the accessory over
+    /// the video controls, the lowest one alone isn't enough. The gap leaves
+    /// room for the bin's armed swell, spring overshoot included.
     private func trashCenterAboveBottomControls() -> CGPoint? {
-        let controls: UIView? = videoControlsTop ?? (customToolbar ?? bottomToolbarBackground)
-        guard let controls, controls.superview != nil else { return nil }
-        let controlsTop = view.convert(controls.bounds, from: controls).minY
-        guard controlsTop > 0 else { return nil }      // not laid out yet
+        let filmstrip: UIView? = showsTrimScrubber ? trimScrubber : nil
+        let strip: UIView? = stripIsInUse ? thumbnailStrip : nil
+        let candidates = [videoControlsTop, filmstrip, toolRowAtBottom, floatingDoneButton, strip, bottomAccessory]
+        let tops = candidates.compactMap { control -> CGFloat? in
+            // Hidden controls count too: the time readout stays hidden until the
+            // clip loads, and the bin should already clear the spot it takes.
+            guard let control, control.superview != nil else { return nil }
+            let frame = view.convert(control.bounds, from: control)
+            return frame.height > 0 ? frame.minY : nil        // not laid out yet
+        }
+        guard let controlsTop = tops.min(), controlsTop > 0 else { return nil }
         let center = CGPoint(x: view.bounds.midX,
                              y: controlsTop - 16 - StickerTrashView.diameter / 2)
         return overlayContainer.convert(center, from: view)
     }
 
+    /// The tool row, when it sits along the bottom rather than in the top bar.
+    private var toolRowAtBottom: UIView? {
+        appearance.toolbarPlacement == .bottom ? toolRowContainer : nil
+    }
+
     private func setupChrome() {
         // Top bar: Cancel / Done
-        let cancel = makeTextButton(L10n.cancel, role: .dismissing, action: #selector(cancelTapped))
-        let done = makeTextButton(L10n.done, role: .confirming, action: #selector(doneTapped))
-        historyBar.axis = .horizontal
-        historyBar.alignment = .center
-        historyBar.spacing = 16
-        historyBar.addArrangedSubview(undoButton)
-        historyBar.addArrangedSubview(redoButton)
-        historyBar.translatesAutoresizingMaskIntoConstraints = false
-        historyBarBackground.translatesAutoresizingMaskIntoConstraints = false
-        historyBarBackground.contentView.addSubview(historyBar)
-        // Its own row under Cancel rather than beside it, so the top bar keeps
-        // the familiar Cancel / Done shape.
-        view.addSubview(historyBarBackground)
+        let cancel = makeCancelButton()
+        setupHistoryBar()
 
         topBar.axis = .horizontal
         topBar.alignment = .center
+        topBar.spacing = 8
         topBar.addArrangedSubview(cancel)
-        topBar.addArrangedSubview(UIView())          // pushes Done to the trailing edge
-        topBar.addArrangedSubview(done)
+        topBar.addArrangedSubview(UIView())          // pushes the rest to the trailing edge
         topBar.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(topBar)
 
@@ -395,55 +664,218 @@ public final class MediaEditorViewController: UIViewController {
             topBar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
             topBar.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
 
-            historyBarBackground.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
-            historyBarBackground.topAnchor.constraint(equalTo: topBar.bottomAnchor, constant: 10),
-
-            historyBar.leadingAnchor.constraint(equalTo: historyBarBackground.contentView.leadingAnchor, constant: 12),
-            historyBar.trailingAnchor.constraint(equalTo: historyBarBackground.contentView.trailingAnchor, constant: -12),
-            historyBar.topAnchor.constraint(equalTo: historyBarBackground.contentView.topAnchor, constant: 4),
-            historyBar.bottomAnchor.constraint(equalTo: historyBarBackground.contentView.bottomAnchor, constant: -4),
+            historyContainer.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            historyContainer.topAnchor.constraint(equalTo: topBar.bottomAnchor, constant: 10),
         ])
 
-        // A host-supplied row replaces the built-in bar outright.
-        if let provider = toolbarProvider,
-           let custom = provider.makeToolbar(for: toolbarActions, editor: self) {
-            customToolbar = custom
-            custom.translatesAutoresizingMaskIntoConstraints = false
-            view.addSubview(custom)
-            NSLayoutConstraint.activate([
-                custom.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 12),
-                custom.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -12),
-                custom.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-                custom.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
-            ])
-            provider.updateToolbar(custom, editor: self)
-            return
+        setupBottomAccessory()
+
+        let row = makeToolRow()
+        toolRowContainer = row
+        switch appearance.toolbarPlacement {
+        case .top:
+            // Tools trail the close button; Done, if the editor shows one, drops
+            // to the bottom trailing corner where a send button would be.
+            if let row {
+                row.setContentCompressionResistancePriority(.required, for: .horizontal)
+                topBar.addArrangedSubview(row)
+            }
+            if showsDoneButton {
+                let done = makeTextButton(L10n.done, role: .confirming, action: #selector(doneTapped))
+                done.translatesAutoresizingMaskIntoConstraints = false
+                view.addSubview(done)
+                NSLayoutConstraint.activate([
+                    done.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+                    done.bottomAnchor.constraint(equalTo: bottomChromeGuide.topAnchor, constant: -12),
+                ])
+                floatingDoneButton = done
+            }
+        case .bottom:
+            if showsDoneButton {
+                topBar.addArrangedSubview(makeTextButton(L10n.done, role: .confirming, action: #selector(doneTapped)))
+            }
+            if let row {
+                row.translatesAutoresizingMaskIntoConstraints = false
+                view.addSubview(row)
+                NSLayoutConstraint.activate([
+                    // The row holds tools only, so it hugs its content and
+                    // centres rather than stretching the full width.
+                    row.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+                    row.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 12),
+                    row.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -12),
+                    row.bottomAnchor.constraint(equalTo: bottomChromeGuide.topAnchor, constant: -12),
+                ])
+            }
         }
 
-        // Bottom toolbar: geometry tools + undo/redo, floating on a glass bar.
-        bottomToolbar.axis = .horizontal
-        bottomToolbar.distribution = .fill
-        bottomToolbar.spacing = 28
-        bottomToolbar.alignment = .center
-        for v in toolbarButtons() { bottomToolbar.addArrangedSubview(v) }
-        bottomToolbar.translatesAutoresizingMaskIntoConstraints = false
-        bottomToolbarBackground.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(bottomToolbarBackground)
-        bottomToolbarBackground.contentView.addSubview(bottomToolbar)
+        if let customToolbar, let toolbarProvider {
+            toolbarProvider.updateToolbar(customToolbar, editor: self)
+        }
+    }
 
+    /// Undo and redo, on their own row under Cancel rather than beside it, so
+    /// the top bar keeps its shape. Drawn like the tool row: two glyphs sharing
+    /// a small glass pill, or a circle each.
+    private func setupHistoryBar() {
+        historyBar.axis = .horizontal
+        historyBar.alignment = .center
+        historyBar.translatesAutoresizingMaskIntoConstraints = false
+        switch appearance.toolbarStyle {
+        case .circularButtons:
+            historyBar.spacing = 8
+            historyBar.addArrangedSubview(appearance.makeCircularBacking(for: undoButton))
+            historyBar.addArrangedSubview(appearance.makeCircularBacking(for: redoButton))
+            historyContainer = historyBar
+        case .floatingBar:
+            historyBar.spacing = 16
+            historyBar.addArrangedSubview(undoButton)
+            historyBar.addArrangedSubview(redoButton)
+            historyBarBackground.translatesAutoresizingMaskIntoConstraints = false
+            historyBarBackground.contentView.addSubview(historyBar)
+            NSLayoutConstraint.activate([
+                historyBar.leadingAnchor.constraint(equalTo: historyBarBackground.contentView.leadingAnchor, constant: 12),
+                historyBar.trailingAnchor.constraint(equalTo: historyBarBackground.contentView.trailingAnchor, constant: -12),
+                historyBar.topAnchor.constraint(equalTo: historyBarBackground.contentView.topAnchor, constant: 4),
+                historyBar.bottomAnchor.constraint(equalTo: historyBarBackground.contentView.bottomAnchor, constant: -4),
+            ])
+            historyContainer = historyBarBackground
+        }
+        view.addSubview(historyContainer)
+    }
+
+    /// Pins the host's accessory full-width to the keyboard, and sizes
+    /// `bottomChromeGuide` to match.
+    ///
+    /// Like a toolbar, the accessory runs to the physical bottom edge so its
+    /// background fills the home-indicator strip, and keeps its content clear
+    /// of that strip through its own `safeAreaInsets`. Those follow the bar: on
+    /// top of the keyboard it no longer overlaps the strip, so the inset drops to
+    /// zero and there is no gap above the keys.
+    private func setupBottomAccessory() {
+        for guide in [accessoryGuide, stripGuide, bottomChromeGuide] { view.addLayoutGuide(guide) }
+        let stripHeight = stripGuide.heightAnchor.constraint(equalToConstant: 0)
+        stripHeightConstraint = stripHeight
         NSLayoutConstraint.activate([
-            // The row now holds tools only, so it hugs its content and centres
-            // rather than stretching the full width.
-            bottomToolbarBackground.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            bottomToolbarBackground.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 12),
-            bottomToolbarBackground.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -12),
-            bottomToolbarBackground.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
+            accessoryGuide.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            accessoryGuide.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            accessoryGuide.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
 
-            bottomToolbar.leadingAnchor.constraint(equalTo: bottomToolbarBackground.contentView.leadingAnchor, constant: 24),
-            bottomToolbar.trailingAnchor.constraint(equalTo: bottomToolbarBackground.contentView.trailingAnchor, constant: -24),
-            bottomToolbar.topAnchor.constraint(equalTo: bottomToolbarBackground.contentView.topAnchor, constant: 12),
-            bottomToolbar.bottomAnchor.constraint(equalTo: bottomToolbarBackground.contentView.bottomAnchor, constant: -12),
+            stripGuide.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            stripGuide.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            stripGuide.bottomAnchor.constraint(equalTo: accessoryGuide.topAnchor),
+            stripHeight,
+
+            bottomChromeGuide.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            bottomChromeGuide.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            bottomChromeGuide.topAnchor.constraint(equalTo: stripGuide.topAnchor),
+            bottomChromeGuide.bottomAnchor.constraint(equalTo: accessoryGuide.bottomAnchor),
         ])
+        guard let accessory = bottomAccessory else {
+            accessoryGuide.heightAnchor.constraint(equalToConstant: 0).isActive = true
+            return
+        }
+        // With the keyboard down the guide rests on the bottom edge rather than
+        // the safe area, which the accessory handles itself.
+        view.keyboardLayoutGuide.usesBottomSafeArea = false
+        accessory.translatesAutoresizingMaskIntoConstraints = false
+        // Slack never goes to the bar, whatever the canvas's content reports.
+        accessory.setContentHuggingPriority(.defaultHigh + 1, for: .vertical)
+        view.addSubview(accessory)
+        // The bar's content height, above the safe area: resting, the bar also
+        // covers the home-indicator strip; lifted by the keyboard it doesn't.
+        // Measuring its content keeps the guide — and everything laid out on
+        // it — still while the user types.
+        let live = accessoryGuide.heightAnchor.constraint(equalTo: accessory.safeAreaLayoutGuide.heightAnchor)
+        accessoryLiveHeight = live
+        NSLayoutConstraint.activate([
+            accessory.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            accessory.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            accessory.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor),
+            live,
+        ])
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(keyboardWillShow(_:)),
+                           name: UIResponder.keyboardWillShowNotification, object: nil)
+        center.addObserver(self, selector: #selector(keyboardWillHide(_:)),
+                           name: UIResponder.keyboardWillHideNotification, object: nil)
+    }
+
+    /// The keyboard is coming up: hold the space reserved for the accessory at
+    /// its resting height, and fade the strip if the appearance asks.
+    @objc private func keyboardWillShow(_ notification: Notification) {
+        guard !isKeyboardUp, let live = accessoryLiveHeight else { return }
+        isKeyboardUp = true
+        let frozen = accessoryGuide.heightAnchor.constraint(equalToConstant: accessoryGuide.layoutFrame.height)
+        live.isActive = false
+        frozen.isActive = true
+        accessoryFrozenHeight = frozen
+        applyStripVisibility(animated: true)
+    }
+
+    /// The keyboard is gone: follow the accessory's content height again —
+    /// animated, in case it changed while the user typed.
+    @objc private func keyboardWillHide(_ notification: Notification) {
+        guard isKeyboardUp else { return }
+        isKeyboardUp = false
+        accessoryFrozenHeight?.isActive = false
+        accessoryFrozenHeight = nil
+        accessoryLiveHeight?.isActive = true
+        applyStripVisibility(animated: true)
+        UIView.animate(withDuration: 0.25) { [weak self] in self?.view.layoutIfNeeded() }
+    }
+
+    /// Builds the tool row — the provider's, when it supplies one — without
+    /// placing it; `setupChrome` decides where it goes.
+    private func makeToolRow() -> UIView? {
+        if let provider = toolbarProvider,
+           let custom = provider.makeToolbar(for: isSingleItemEditor ? toolbarActions : sessionToolbarActions,
+                                             editor: self) {
+            customToolbar = custom
+            return custom
+        }
+        let buttons = toolbarButtons()
+        // A session may move on to media with tools even if this one has none.
+        guard !buttons.isEmpty || !isSingleItemEditor else { return nil }
+
+        toolRow.axis = .horizontal
+        toolRow.distribution = .fill
+        toolRow.alignment = .center
+        for v in buttons { toolRow.addArrangedSubview(v) }
+
+        switch appearance.toolbarStyle {
+        case .circularButtons:
+            // Each button carries its own backing, so the row itself is bare.
+            toolRow.spacing = appearance.toolbarPlacement == .top ? 8 : 12
+            return toolRow
+        case .floatingBar:
+            // Tighter in the top bar, where it shares the width with Cancel.
+            toolRow.spacing = appearance.toolbarPlacement == .top ? 20 : 28
+            let inset: CGFloat = appearance.toolbarPlacement == .top ? 16 : 24
+            toolRow.translatesAutoresizingMaskIntoConstraints = false
+            toolRowBackground.contentView.addSubview(toolRow)
+            NSLayoutConstraint.activate([
+                toolRow.leadingAnchor.constraint(equalTo: toolRowBackground.contentView.leadingAnchor, constant: inset),
+                toolRow.trailingAnchor.constraint(equalTo: toolRowBackground.contentView.trailingAnchor, constant: -inset),
+                toolRow.topAnchor.constraint(equalTo: toolRowBackground.contentView.topAnchor, constant: 12),
+                toolRow.bottomAnchor.constraint(equalTo: toolRowBackground.contentView.bottomAnchor, constant: -12),
+            ])
+            return toolRowBackground
+        }
+    }
+
+    /// Cancel as a titled bar button, or as an ✕ on a circular backing to match
+    /// ``EditorToolbarStyle/circularButtons``.
+    private func makeCancelButton() -> UIView {
+        switch appearance.toolbarStyle {
+        case .floatingBar:
+            return makeTextButton(L10n.cancel, role: .dismissing, action: #selector(cancelTapped))
+        case .circularButtons:
+            let button = makeSymbolButton(symbol: appearance.symbols[.cancel] ?? "xmark",
+                                          selector: #selector(cancelTapped))
+            button.accessibilityLabel = L10n.cancel
+            appearance.styleToolButton?(button, .cancel)
+            return appearance.makeCircularBacking(for: button)
+        }
     }
 
     private func setupCropChrome() {
@@ -463,17 +895,10 @@ public final class MediaEditorViewController: UIViewController {
         view.addSubview(cropTopBar)
 
         // Crop tools bar (flip / rotate presets), leading under the top bar.
-        let tools = configuration.tools(for: item.kind)
         cropToolsBar.axis = .horizontal
         cropToolsBar.spacing = 18
         cropToolsBar.alignment = .center
-        if tools.contains(.flip) {
-            cropToolsBar.addArrangedSubview(makeToolButton(.flipHorizontal, selector: #selector(cropFlipHTapped)))
-            cropToolsBar.addArrangedSubview(makeToolButton(.flipVertical, selector: #selector(cropFlipVTapped)))
-        }
-        if tools.contains(.rotate) {
-            cropToolsBar.addArrangedSubview(makeToolButton(.rotate, selector: #selector(cropRotateTapped)))
-        }
+        for button in cropToolButtons() { cropToolsBar.addArrangedSubview(button) }
         cropToolsBar.translatesAutoresizingMaskIntoConstraints = false
         cropToolsBackground.translatesAutoresizingMaskIntoConstraints = false
         cropToolsBackground.isHidden = true
@@ -482,6 +907,8 @@ public final class MediaEditorViewController: UIViewController {
 
         // Manual straighten dial, above the aspect bar.
         rotationDial.delegate = self
+        cropOverlay.onAdjustmentBegan = { [weak self] in self?.cropAdjustmentBegan() }
+        cropOverlay.onAdjustmentEnded = { [weak self] in self?.cropAdjustmentEnded() }
         rotationDial.translatesAutoresizingMaskIntoConstraints = false
         rotationDial.isHidden = true
         view.addSubview(rotationDial)
@@ -547,6 +974,20 @@ public final class MediaEditorViewController: UIViewController {
         ])
     }
 
+    /// The crop tool's flip and rotate presets the selected media offers.
+    private func cropToolButtons() -> [UIButton] {
+        let tools = configuration.tools(for: item.kind)
+        var buttons: [UIButton] = []
+        if tools.contains(.flip) {
+            buttons.append(makeToolButton(.flipHorizontal, selector: #selector(cropFlipHTapped)))
+            buttons.append(makeToolButton(.flipVertical, selector: #selector(cropFlipVTapped)))
+        }
+        if tools.contains(.rotate) {
+            buttons.append(makeToolButton(.rotate, selector: #selector(cropRotateTapped)))
+        }
+        return buttons
+    }
+
     private func setupDrawChrome() {
         let cancel = makeTextButton(L10n.cancel, role: .dismissing, action: #selector(cancelDrawTapped))
         let title = drawTitleLabel
@@ -567,6 +1008,10 @@ public final class MediaEditorViewController: UIViewController {
         canvasView.accessibilityIgnoresInvertColors = true
         canvasView.backgroundColor = .clear
         canvasView.isOpaque = false
+        // Strokes are drawn straight onto the media, so show their true colours
+        // rather than PencilKit's dark-mode adaptation — the canvas is clear, so
+        // nothing else about it looks light.
+        canvasView.overrideUserInterfaceStyle = .light
         canvasView.alwaysBounceVertical = false
         canvasView.alwaysBounceHorizontal = false
 
@@ -616,9 +1061,10 @@ public final class MediaEditorViewController: UIViewController {
         ])
     }
 
-    /// Builds the enabled geometry tool buttons plus undo/redo.
+    /// Builds the enabled tool buttons, each on its circular backing when the
+    /// appearance asks for one.
     private func toolbarButtons() -> [UIView] {
-        var buttons: [UIView] = []
+        var buttons: [UIButton] = []
         let tools = configuration.tools(for: item.kind)
         if tools.contains(.crop) {
             buttons.append(makeToolButton(.crop, selector: #selector(cropTapped)))
@@ -645,11 +1091,20 @@ public final class MediaEditorViewController: UIViewController {
             buttons.append(makeToolButton(.addPhoto, selector: #selector(addPhotoTapped)))
         }
         if tools.contains(.audio) {
-            // Stays out of the row until the asset is known to carry audio.
-            audioButton.isHidden = true
             buttons.append(audioButton)
         }
-        return buttons
+        let views: [UIView] = buttons.map { button in
+            let host = appearance.toolbarStyle == .circularButtons
+                ? appearance.makeCircularBacking(for: button)
+                : button
+            if button === audioButton {
+                // Stays out of the row until the asset is known to carry audio.
+                audioButtonHost = host
+                host.isHidden = true
+            }
+            return host
+        }
+        return views
     }
 
     /// A tool-row button for `action`, styled through the appearance so a host
@@ -710,7 +1165,9 @@ public final class MediaEditorViewController: UIViewController {
     private func refreshPreviewSourceIfNeeded() -> Bool {
         guard let sourceCGImage, isViewLoaded else { return false }
         let scale = view.window?.screen.scale ?? UIScreen.main.scale
-        let cap = (max(imageView.bounds.width, imageView.bounds.height) * scale).rounded()
+        // Zoomed in, the preview shows more pixels per point — up to the
+        // source's own, which the check below caps it at.
+        let cap = (max(imageView.bounds.width, imageView.bounds.height) * scale * zoomScale).rounded()
         guard cap > 0, abs(cap - previewSourceCap) > 1 else { return false }
         previewSourceCap = cap
 
@@ -727,12 +1184,61 @@ public final class MediaEditorViewController: UIViewController {
         guard mode == .normal else { return }        // crop/draw modes manage their own image
         guard let source = previewSource, isViewLoaded else { return }
         guard let rendered = renderer.renderGeometry(cgImage: source, recipe: recipe) else { return }
-        var image = UIImage(cgImage: rendered)
-        // Bake the drawing into the preview (overlays stay as live views on top).
-        if let drawing = recipe.drawing {
-            image = drawingCompositor.composite(base: image, drawing: drawing)
+        // The drawing and overlays are live layers on top, not baked in.
+        imageView.image = UIImage(cgImage: rendered)
+        syncOverlayCanvas()
+    }
+
+    /// Where the stickers and the drawing are laid out, in the image view's
+    /// coordinates: over the displayed media. In crop mode that's the whole
+    /// rotated frame, and the edits are carried onto it (see
+    /// `showEditsOverCropPreview`).
+    private func overlayCanvasFrame() -> CGRect {
+        displayedImageFrame()
+    }
+
+    /// Rasterizes the recipe's drawing when it changes, and stacks it where the
+    /// recipe says among the stickers.
+    private func updateDrawingLayer() {
+        showDrawing(recipe.drawing)
+    }
+
+    /// Puts `drawing` on screen, re-rasterizing only when it changed.
+    ///
+    /// Drawn at the authoring canvas size — the media's on-screen size when the
+    /// strokes went down — and stretched with the media from there, as the
+    /// export stretches it to the output size.
+    private func showDrawing(_ drawing: DrawingData?) {
+        overlayContainer.drawingZIndex = drawing?.zIndex ?? .min
+        shownDrawing = drawing
+        rasterizeDrawingIfNeeded()
+    }
+
+    /// Rasterizes the shown drawing at the size it's displayed at — not its
+    /// canvas size, which after a crop can be far smaller (blurry) or, carried
+    /// onto a wider frame, far larger (tens of megabytes) than the screen.
+    private func rasterizeDrawingIfNeeded() {
+        guard let drawing = shownDrawing else {
+            renderedDrawing = nil
+            drawingLayerView.image = nil
+            return
         }
-        imageView.image = image
+        let scale = max(1, traitCollection.displayScale)
+        let frame = overlayContainer.imageFrame.size
+        let points = frame.width > 0 && frame.height > 0
+            ? frame : CGSize(width: drawing.canvasWidth, height: drawing.canvasHeight)
+        let pixels = CGSize(width: (points.width * scale).rounded(), height: (points.height * scale).rounded())
+        guard pixels != renderedDrawingPixels || drawing != renderedDrawing else { return }
+        renderedDrawing = drawing
+        renderedDrawingPixels = pixels
+        drawingLayerView.image = drawingCompositor.strokeImage(for: drawing, outputSize: pixels)
+    }
+
+    /// Lays the stickers and drawing over the displayed media, re-rasterizing
+    /// the drawing if its on-screen size changed.
+    private func syncOverlayCanvas() {
+        overlayContainer.imageFrame = overlayCanvasFrame()
+        rasterizeDrawingIfNeeded()
     }
 
     /// The rect within `imageView.bounds` where the image is actually displayed
@@ -752,7 +1258,33 @@ public final class MediaEditorViewController: UIViewController {
         redoButton.isEnabled = history.canRedo
         undoButton.alpha = history.canUndo ? 1 : 0.35
         redoButton.alpha = history.canRedo ? 1 : 0.35
+        updateHistoryVisibility(animated: isViewLoaded && view.window != nil)
         notifyToolbarStateChanged()
+    }
+
+    /// Undo/redo stay out of sight until there is something to undo or redo,
+    /// and while a tool is open — it has its own Cancel.
+    private func updateHistoryVisibility(animated: Bool) {
+        let show = mode == .normal && !isPassthrough && (history.canUndo || history.canRedo)
+        let target: CGFloat = show ? 1 : 0
+        guard animated else {
+            historyContainer.layer.removeAllAnimations()
+            historyContainer.alpha = target
+            historyContainer.isHidden = !show
+            return
+        }
+        guard historyContainer.isHidden == show || historyContainer.alpha != target else { return }
+        if show && historyContainer.isHidden {
+            historyContainer.alpha = 0
+            historyContainer.isHidden = false
+        }
+        UIView.animate(withDuration: 0.2, animations: { [weak self] in
+            self?.historyContainer.alpha = target
+        }, completion: { [weak self] _ in
+            // A later call may have brought it back mid-fade.
+            guard let self, historyContainer.alpha == 0 else { return }
+            historyContainer.isHidden = true
+        })
     }
 
     /// Lets a host-supplied tool row refresh itself after any state change.
@@ -761,21 +1293,68 @@ public final class MediaEditorViewController: UIViewController {
         toolbarProvider.updateToolbar(customToolbar, editor: self)
     }
 
-    /// Shows or hides whichever tool row is in play. A custom row can opt out
-    /// of being hidden while a modal tool is open.
+    /// Shows or hides the main-mode chrome while a tool has the screen.
     private func setMainToolbarHidden(_ hidden: Bool) {
-        if let customToolbar {
-            guard toolbarProvider?.hidesToolbarInToolMode(customToolbar) ?? true else { return }
-            customToolbar.isHidden = hidden
-        } else {
-            bottomToolbarBackground.isHidden = hidden
-        }
+        if hidden { bottomAccessory?.endEditing(true) }     // a tool is taking over the screen
+        isToolOpen = hidden
+        refreshMainChrome()
     }
 
-    /// The top of the tool row, whichever one is in play — the trim scrubber
-    /// sits above it.
-    private var toolbarTopAnchor: NSLayoutYAxisAnchor {
-        customToolbar?.topAnchor ?? bottomToolbar.topAnchor
+    /// Brings the main-mode chrome in line with the editor's state: hidden
+    /// while a tool is open — the tool row, the floating Done button, the strip
+    /// and the accessory — and the tool row also for media it has nothing to
+    /// offer, such as passthrough content. A custom row can opt out of hiding
+    /// while a tool is open — though at the top it lives in the top bar, which
+    /// every tool swaps out for its own.
+    private func refreshMainChrome() {
+        updateHistoryVisibility(animated: false)
+        bottomAccessory?.isHidden = isToolOpen
+        floatingDoneButton?.isHidden = isToolOpen
+        let nothingToOffer = isPassthrough || (customToolbar == nil && toolRow.arrangedSubviews.isEmpty)
+        if let customToolbar {
+            let hidesForTool = isToolOpen && (toolbarProvider?.hidesToolbarInToolMode(customToolbar) ?? true)
+            customToolbar.isHidden = hidesForTool || isPassthrough
+        } else {
+            toolRowContainer?.isHidden = isToolOpen || nothingToOffer
+        }
+        applyStripVisibility(animated: false)
+    }
+
+    /// What the video controls stack above — the tool row when it sits at the
+    /// bottom (the buttons themselves, for the glass bar), otherwise the floating
+    /// Done button or the accessory's resting place.
+    private var bottomChromeTopAnchor: NSLayoutYAxisAnchor {
+        if appearance.toolbarPlacement == .bottom, let toolRowContainer {
+            return toolRowContainer === toolRowBackground ? toolRow.topAnchor : toolRowContainer.topAnchor
+        }
+        return floatingDoneButton?.topAnchor ?? bottomChromeGuide.topAnchor
+    }
+
+    // MARK: - Geometry changes
+
+    /// `next`, with `old`'s stickers and drawing moved so they stay on the same
+    /// part of the media under `next`'s flip, rotation and crop — rather than
+    /// riding along with the frame.
+    private func carryingEdits(into next: EditRecipe, from old: EditRecipe) -> EditRecipe {
+        let size = cropSourceSize
+        guard size.width > 0, size.height > 0,
+              next.rotation != old.rotation || next.flip != old.flip || next.crop?.rect != old.crop?.rect
+        else { return next }
+        var carried = next.carryingOverlays(from: old, sourceSize: size)
+        if let drawing = old.drawing {
+            let before = MediaGeometry(recipe: old, sourceSize: size)
+            let after = MediaGeometry(recipe: next, sourceSize: size)
+            carried.drawing = drawingCompositor.carried(drawing, by: before.transform(to: after),
+                                                        from: before.outputSize, to: after.outputSize)
+        }
+        return carried
+    }
+
+    /// Records a flip, rotation or crop, carrying the edits along with the
+    /// media.
+    private func applyGeometry(_ next: EditRecipe) {
+        apply(carryingEdits(into: next, from: recipe))
+        reloadOverlaysFromRecipe()
     }
 
     // MARK: - Crop mode
@@ -787,15 +1366,13 @@ public final class MediaEditorViewController: UIViewController {
     public func enterCropMode() {
         guard mode == .normal, cropSourceSize.width > 0, cropSourceSize.height > 0 else { return }
         if case .photo = item, sourceCGImage == nil { return }
+        resetZoom()
         mode = .crop
 
         // A still frame is what you compose a crop against, and the transport
         // and filmstrip would collide with the crop chrome.
         if case .video = item {
             setPlaybackChromeHidden(true)
-            // Crop shows the whole uncropped frame; the strokes belong to the
-            // cropped one.
-            videoDrawingView.isHidden = true
         }
 
         // Split the recipe's rotation into a 90° preset base and a straighten
@@ -807,8 +1384,14 @@ public final class MediaEditorViewController: UIViewController {
         cropFlip = recipe.flip
         rotationDial.setDegrees(cropStraighten)
 
+        // The edits stay in view, on the part of the media they belong to, and
+        // step aside only while the user adjusts. They're for looking at only.
         overlayContainer.deselect()
-        overlayContainer.isHidden = true
+        overlayContainer.isUserInteractionEnabled = false
+        // The whole frame is on show; the crop overlay dims what the crop
+        // leaves out, stickers included.
+        overlayContainer.clipsToCanvas = false
+        cropShowsEdits = true
 
         // A fresh crop starts locked to the source's own ratio, so the frame
         // opens on the whole media rather than a freeform rect.
@@ -823,6 +1406,7 @@ public final class MediaEditorViewController: UIViewController {
         } else {
             cropOverlay.reset()
         }
+        showEditsOverCropPreview()
 
         topBar.isHidden = true
         setMainToolbarHidden(true)
@@ -864,6 +1448,7 @@ public final class MediaEditorViewController: UIViewController {
         var geo = EditRecipe()
         geo.rotation = RotationState(degrees: cropTotalDegrees)
         geo.flip = cropFlip
+        geo.filter = recipe.filter          // the look stays; only geometry is being edited
         if let rendered = renderer.renderGeometry(cgImage: source, recipe: geo) {
             imageView.image = UIImage(cgImage: rendered)
         }
@@ -883,35 +1468,97 @@ public final class MediaEditorViewController: UIViewController {
         let aw = bbox.width * CGFloat(frac.width)
         let ah = bbox.height * CGFloat(frac.height)
         cropOverlay.allowedRect = CGRect(x: bbox.midX - aw / 2, y: bbox.midY - ah / 2, width: aw, height: ah)
+        syncOverlayCanvas()
+    }
+
+    /// The user started changing the crop: fade the edits out while the frame
+    /// moves under them. A tap-sized change (rotate, flip, an aspect preset)
+    /// hides them at once, since the frame jumps straight to its new place.
+    private func cropAdjustmentBegan(instant: Bool = false) {
+        guard mode == .crop, cropShowsEdits else { return }
+        cropShowsEdits = false
+        overlayContainer.layer.removeAllAnimations()
+        UIView.animate(withDuration: instant ? 0 : 0.15) { [weak self] in self?.overlayContainer.alpha = 0 }
+    }
+
+    /// The change is done: bring the edits back, still on the same spot of the
+    /// media — turned or mirrored with it if it was, and wherever the crop frame
+    /// now happens to be.
+    private func cropAdjustmentEnded() {
+        guard mode == .crop, !cropShowsEdits else { return }
+        cropShowsEdits = true
+        showEditsOverCropPreview()
+        UIView.animate(withDuration: 0.25) { [weak self] in self?.overlayContainer.alpha = 1 }
+    }
+
+    /// Lays the edits over the crop tool's preview — the whole frame under the
+    /// working rotation and flip — by carrying them from the recipe's geometry.
+    private func showEditsOverCropPreview() {
+        var whole = recipe
+        whole.rotation = RotationState(degrees: cropTotalDegrees)
+        whole.flip = cropFlip
+        whole.crop = nil
+        let shown = carryingEdits(into: whole, from: recipe)
+        syncOverlayCanvas()
+        overlayContainer.reload(overlays: shown.overlays, images: overlayImages)
+        showDrawing(shown.drawing)
+    }
+
+    /// Wraps a one-tap change to the crop — the frame jumps, the edits follow.
+    private func adjustCrop(_ change: () -> Void) {
+        cropAdjustmentBegan(instant: true)
+        change()
+        cropAdjustmentEnded()
     }
 
     @objc private func cropFlipHTapped() {
-        cropFlip.horizontal.toggle()
-        renderCropPreview()
+        adjustCrop {
+            cropFlip.horizontal.toggle()
+            renderCropPreview()
+        }
     }
 
     @objc private func cropFlipVTapped() {
-        cropFlip.vertical.toggle()
-        renderCropPreview()
+        adjustCrop {
+            cropFlip.vertical.toggle()
+            renderCropPreview()
+        }
     }
 
     @objc private func cropRotateTapped() {
-        cropRotationBase += 90            // rotate 90° clockwise
-        renderCropPreview()
-        cropOverlay.reset()
+        adjustCrop {
+            cropRotationBase += 90            // rotate 90° clockwise
+            renderCropPreview()
+            cropOverlay.reset()
+        }
     }
 
     @objc private func applyCropTapped() {
         var next = recipe
-        next.rotation = RotationState(degrees: cropTotalDegrees)
+        // Four quarter turns are no turn at all, not a 360° edit.
+        next.rotation = RotationState(degrees: cropTotalDegrees.truncatingRemainder(dividingBy: 360))
         next.flip = cropFlip
         if cropOverlay.isEffectivelyFull {
             next.crop = nil
         } else {
-            next.crop = CropState(rect: cropOverlay.normalizedCropRect(), aspect: cropOverlay.aspect)
+            let rect = cropOverlay.normalizedCropRect()
+            // Opening crop and applying straight away round-trips the rect
+            // through screen points; keep the recipe's own rather than record
+            // floating-point noise as an edit (and move every sticker for it).
+            if let current = recipe.crop, current.aspect == cropOverlay.aspect,
+               current.rect.isClose(to: rect) {
+                next.crop = current
+            } else {
+                next.crop = CropState(rect: rect, aspect: cropOverlay.aspect)
+            }
         }
-        exitCropMode()
-        apply(next)
+        let changed = next.rendersDifferently(from: recipe)
+        // `applyGeometry` lays the edits out for the new recipe itself.
+        exitCropMode(restoringEdits: false)
+        applyGeometry(next)
+        // An unchanged recipe doesn't re-render, and the preview still shows
+        // the whole uncropped frame from crop mode.
+        if !changed { renderPreview() }
     }
 
     @objc private func cancelCropTapped() {
@@ -920,15 +1567,17 @@ public final class MediaEditorViewController: UIViewController {
     }
 
     @objc private func resetCropTapped() {
-        cropStraighten = 0
-        rotationDial.setDegrees(0)
-        renderCropPreview()
-        cropOverlay.reset()
+        adjustCrop {
+            cropStraighten = 0
+            rotationDial.setDegrees(0)
+            renderCropPreview()
+            cropOverlay.reset()
+        }
     }
 
     @objc private func aspectTapped(_ sender: UIButton) {
         guard let match = aspectButtons.first(where: { $0.button === sender }) else { return }
-        cropOverlay.aspect = match.preset
+        adjustCrop { cropOverlay.aspect = match.preset }
         highlightAspectButton(for: match.preset)
     }
 
@@ -966,16 +1615,27 @@ public final class MediaEditorViewController: UIViewController {
         }
     }
 
-    private func exitCropMode() {
+    /// Leaves crop mode. `restoringEdits` puts the recipe's own sticker and
+    /// drawing layout back; Apply skips it, since it lays them out anew.
+    private func exitCropMode(restoringEdits: Bool = true) {
         mode = .normal
         cropOverlay.removeFromSuperview()
         if case .video = item {
             setPlaybackChromeHidden(false)
-            videoDrawingView.isHidden = false
             // Back to the recipe's own geometry, crop included.
             layoutVideoPreview()
         }
-        overlayContainer.isHidden = false
+        cropShowsEdits = false
+        overlayContainer.layer.removeAllAnimations()
+        overlayContainer.alpha = 1
+        overlayContainer.isUserInteractionEnabled = true
+        overlayContainer.clipsToCanvas = true
+        // Back to the recipe's own layout of the edits.
+        syncOverlayCanvas()
+        if restoringEdits {
+            reloadOverlaysFromRecipe()
+            updateDrawingLayer()
+        }
         topBar.isHidden = false
         setMainToolbarHidden(false)
         cropTopBar.isHidden = true
@@ -1015,38 +1675,37 @@ public final class MediaEditorViewController: UIViewController {
 
     // MARK: - Video
 
-    private func setupVideo(url: URL) {
-        let asset = AVURLAsset(url: url)
-        videoAsset = asset
+    /// Whether the session offers the filmstrip for its videos.
+    private var offersTrim: Bool { configuration.tools(for: .video).contains(.trim) }
 
-        let playerItem = AVPlayerItem(asset: asset)
-        let player = AVPlayer(playerItem: playerItem)
-        player.actionAtItemEnd = .none
-        let layer = AVPlayerLayer(player: player)
-        // The layer is sized to the video's own aspect by `layoutVideoPreview`,
-        // and the container crops it, so the layer itself fills exactly.
-        layer.videoGravity = .resize
-        videoContainer.clipsToBounds = true
-        videoContainer.layer.addSublayer(layer)
-        // Strokes sit above the picture and inside the clip, stretched with it.
-        videoDrawingView.contentMode = .scaleToFill
-        videoDrawingView.isUserInteractionEnabled = false
-        videoContainer.addSubview(videoDrawingView)
-        imageView.addSubview(videoContainer)
-        self.player = player
-        self.playerLayer = layer
+    // The video controls' layout, shared with the page turn, which has to
+    // know where a video will sit before its controls exist.
+    private static let filmstripHeight: CGFloat = 60
+    private static let filmstripBottomGap: CGFloat = 12
+    private static let timeLabelHeight: CGFloat = 16
+    private static let timeLabelBottomGap: CGFloat = 8
+    /// The space between the video's box and the controls under it.
+    private static let videoControlsGap: CGFloat = 12
+    /// The transport, filmstrip and readout have been added to the view.
+    private var hasVideoChrome = false
+
+    /// Adds the transport, filmstrip and time readout — once: a session reuses
+    /// them for every video it shows, and hides them for everything else.
+    private func installVideoChromeIfNeeded() {
+        guard !hasVideoChrome else { return }
+        hasVideoChrome = true
 
         // The filmstrip is a configurable tool, not fixed furniture: a host that
         // leaves `.trim` out gets playback and the other tools without it.
-        if showsTrimScrubber {
+        if offersTrim {
             trimScrubber.delegate = self
             trimScrubber.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview(trimScrubber)
             NSLayoutConstraint.activate([
                 trimScrubber.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
                 trimScrubber.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
-                trimScrubber.bottomAnchor.constraint(equalTo: toolbarTopAnchor, constant: -12),
-                trimScrubber.heightAnchor.constraint(equalToConstant: 60),
+                trimScrubber.bottomAnchor.constraint(equalTo: bottomChromeTopAnchor, constant: -Self.filmstripBottomGap),
+                trimScrubber.heightAnchor.constraint(equalToConstant: Self.filmstripHeight),
             ])
         }
 
@@ -1075,9 +1734,9 @@ public final class MediaEditorViewController: UIViewController {
         view.addSubview(timeLabel)
         NSLayoutConstraint.activate([
             timeLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            timeLabel.bottomAnchor.constraint(equalTo: showsTrimScrubber ? trimScrubber.topAnchor : toolbarTopAnchor,
-                                              constant: -8),
-            timeLabel.heightAnchor.constraint(equalToConstant: ceil(timeLabel.font.lineHeight)),
+            timeLabel.bottomAnchor.constraint(equalTo: offersTrim ? trimScrubber.topAnchor : bottomChromeTopAnchor,
+                                              constant: -Self.timeLabelBottomGap),
+            timeLabel.heightAnchor.constraint(equalToConstant: Self.timeLabelHeight),
         ])
 
         displayLinkProxy.onTick = { [weak self] in
@@ -1085,6 +1744,31 @@ public final class MediaEditorViewController: UIViewController {
             playbackTick()
             return true
         }
+        liftChromeAbovePreview()
+    }
+
+    /// Puts the video at `url` on the canvas: a player clipped to the recipe's
+    /// crop, a display link for the playhead, and the asset's duration, tracks
+    /// and size loaded in the background.
+    private func loadVideo(url: URL) {
+        installVideoChromeIfNeeded()
+        let asset = AVURLAsset(url: url)
+        videoAsset = asset
+
+        let playerItem = AVPlayerItem(asset: asset)
+        let player = AVPlayer(playerItem: playerItem)
+        player.actionAtItemEnd = .none
+        let layer = AVPlayerLayer(player: player)
+        // The layer is sized to the video's own aspect by `layoutVideoPreview`,
+        // and the container crops it, so the layer itself fills exactly.
+        layer.videoGravity = .resize
+        videoContainer.clipsToBounds = true
+        videoContainer.layer.addSublayer(layer)
+        imageView.addSubview(videoContainer)
+        self.player = player
+        self.playerLayer = layer
+        setPlaybackChromeHidden(isToolOpen)
+
         let link = CADisplayLink(target: displayLinkProxy,
                                  selector: #selector(DisplayLinkProxy.tick(_:)))
         // The tick only nudges a playhead and watches for the player stopping;
@@ -1094,24 +1778,53 @@ public final class MediaEditorViewController: UIViewController {
         link.add(to: .main, forMode: .common)
         displayLink = link
 
-        Task { @MainActor [weak self] in
-            guard let self else { return }
+        videoLoadTask = Task { @MainActor [weak self] in
             let duration = (try? await asset.load(.duration))?.seconds ?? 0
+            guard let self, !Task.isCancelled, videoAsset === asset else { return }
             videoDuration = duration
             videoTrimStart = recipe.trim?.start ?? 0
             videoTrimEnd = recipe.trim?.end ?? duration
             timeLabel.configure(duration: duration)
+            timeLabel.isHidden = isToolOpen
             if showsTrimScrubber {
                 trimScrubber.configure(asset: asset, duration: duration)
                 if let trim = recipe.trim { trimScrubber.setTrim(start: trim.start, end: trim.end) }
             }
-            hasAudioTrack = !((try? await asset.loadTracks(withMediaType: .audio)) ?? []).isEmpty
-            videoOrientedSize = await orientedSize(of: asset)
+            let hasAudio = !((try? await asset.loadTracks(withMediaType: .audio)) ?? []).isEmpty
+            let size = await orientedSize(of: asset)
+            guard !Task.isCancelled, videoAsset === asset else { return }
+            hasAudioTrack = hasAudio
+            videoOrientedSize = size
             syncVideoState()
             // Park on the first frame — unless the user already hit play while
             // the asset was still loading.
             if !isVideoPlaying { park(at: videoTrimStart) } else { refreshTimeReadout() }
         }
+    }
+
+    /// Takes the selected video off the canvas: stops and releases its player,
+    /// invalidates its display link, and hides the controls until the next one.
+    private func unloadVideo() {
+        videoLoadTask?.cancel()
+        videoLoadTask = nil
+        displayLink?.invalidate()
+        displayLink = nil
+        player?.pause()
+        if playPauseButton.isPlaying { playPauseButton.setPlaying(false, animated: false) }
+        playerLayer?.removeFromSuperlayer()
+        videoContainer.removeFromSuperview()
+        player = nil
+        playerLayer = nil
+        videoAsset = nil
+        videoDuration = nil
+        videoOrientedSize = .zero
+        hasAudioTrack = false
+        playbackPosition = 0
+        videoTrimStart = 0
+        videoTrimEnd = .greatestFiniteMagnitude
+        playPauseButton.isHidden = true
+        trimScrubber.isHidden = true
+        timeLabel.isHidden = true
     }
 
     /// Mirrors the recipe onto the live preview: mute state, the audio toggle,
@@ -1124,8 +1837,8 @@ public final class MediaEditorViewController: UIViewController {
             syncTransport(animated: false)
         }
         playPauseButton.isHidden = hidden
-        trimScrubber.isHidden = hidden
-        timeLabel.isHidden = hidden || !timeLabel.isConfigured
+        trimScrubber.isHidden = hidden || !showsTrimScrubber
+        timeLabel.isHidden = hidden || videoDuration == nil
     }
 
     private func syncVideoState() {
@@ -1134,25 +1847,7 @@ public final class MediaEditorViewController: UIViewController {
         // Undo/redo can change the trim without the filmstrip being touched, so
         // the handles, loop range and readout have to follow the recipe.
         syncTrimFromRecipe()
-        updateVideoDrawing()
         layoutVideoPreview()
-    }
-
-    /// Rasterizes the recipe's drawing for the video preview when it changes.
-    ///
-    /// Drawn at the authoring canvas size — the frame's on-screen size when the
-    /// strokes went down — and stretched with the frame from there, as the export
-    /// stretches it to the output size.
-    private func updateVideoDrawing() {
-        guard recipe.drawing != renderedVideoDrawing else { return }
-        renderedVideoDrawing = recipe.drawing
-        guard let drawing = recipe.drawing else {
-            videoDrawingView.image = nil
-            return
-        }
-        let scale = max(1, traitCollection.displayScale)
-        let pixels = CGSize(width: drawing.canvasWidth * scale, height: drawing.canvasHeight * scale)
-        videoDrawingView.image = drawingCompositor.strokeImage(for: drawing, outputSize: pixels)
     }
 
     private func syncTrimFromRecipe() {
@@ -1199,7 +1894,10 @@ public final class MediaEditorViewController: UIViewController {
     /// Whether the player is playing, or actively trying to. The player is the
     /// single source of truth here — it also stops on its own, and the asset
     /// loads asynchronously, so a separate flag drifts out of step with it.
-    var isVideoPlaying: Bool { player?.timeControlStatus != .paused }
+    var isVideoPlaying: Bool {
+        guard let player else { return false }        // no video on the canvas
+        return player.timeControlStatus != .paused
+    }
 
     /// Whether the frame callback is currently idle. Exposed for tests, which
     /// assert the editor isn't waking every frame for a parked video.
@@ -1233,7 +1931,15 @@ public final class MediaEditorViewController: UIViewController {
     /// Mirrors `recipe.removeAudio` onto the toggle, and keeps it out of the
     /// toolbar entirely for a source that has no audio to remove.
     private func updateAudioButton() {
-        audioButton.isHidden = !hasAudioTrack
+        // Hide whatever sits in the row: the circular backing, or the button
+        // itself. The button inside a backing must stay visible — a session
+        // may have hidden it before the row was rebuilt around a new backing.
+        if let host = audioButtonHost, host !== audioButton {
+            host.isHidden = !hasAudioTrack
+            audioButton.isHidden = false
+        } else {
+            audioButton.isHidden = !hasAudioTrack
+        }
         let muted = recipe.removeAudio
         // The "on" state gets its own glyph; a host overriding the symbol for
         // `.toggleAudio` keeps control of the "off" one.
@@ -1275,7 +1981,7 @@ public final class MediaEditorViewController: UIViewController {
     private var videoPreviewBounds: CGRect {
         let box = imageView.bounds
         guard mode != .crop, let controls = videoControlsTop, controls.frame.height > 0 else { return box }
-        let limit = imageView.convert(controls.frame, from: view).minY - 12
+        let limit = imageView.convert(controls.frame, from: view).minY - Self.videoControlsGap
         guard limit > box.minY, limit < box.maxY else { return box }
         return CGRect(x: box.minX, y: box.minY, width: box.width, height: limit - box.minY)
     }
@@ -1314,7 +2020,6 @@ public final class MediaEditorViewController: UIViewController {
         CATransaction.begin()
         CATransaction.setDisableActions(true)   // geometry tracks the recipe, it isn't an animation
         videoContainer.frame = display
-        videoDrawingView.frame = videoContainer.bounds
         playerLayer.bounds = CGRect(origin: .zero, size: CGSize(width: w * scale, height: h * scale))
         // Centre the rotated frame in the container, offset by the crop origin.
         playerLayer.position = CGPoint(
@@ -1328,7 +2033,7 @@ public final class MediaEditorViewController: UIViewController {
         CATransaction.commit()
 
         alignTransport(to: display)
-        overlayContainer.imageFrame = displayedImageFrame()
+        syncOverlayCanvas()
     }
 
     private func seek(to seconds: Double) {
@@ -1362,57 +2067,6 @@ public final class MediaEditorViewController: UIViewController {
         exportTask?.cancel()
     }
 
-    // MARK: - Video export
-
-    private func exportVideo() {
-        guard let asset = videoAsset else { onFinish?(.cancelled); return }
-        // Don't leave the preview running behind the export panel.
-        player?.pause()
-        syncTransport(animated: false)
-        let output = FileManager.default.temporaryDirectory
-            .appendingPathComponent("MediaEditor-\(UUID().uuidString).mp4")
-        let hud = ExportProgressView(appearance: appearance)
-        hud.translatesAutoresizingMaskIntoConstraints = false
-        hud.onCancel = { [weak self] in self?.exportTask?.cancel() }
-        view.addSubview(hud)
-        NSLayoutConstraint.activate([
-            hud.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            hud.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            hud.topAnchor.constraint(equalTo: view.topAnchor),
-            hud.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-        ])
-
-        exportTask = Task { @MainActor in
-            defer { hud.removeFromSuperview() }
-            do {
-                try await composer.export(
-                    asset: asset, recipe: recipe, to: output,
-                    preset: configuration.videoExportPreset,
-                    maximumDimension: configuration.maximumExportDimension,
-                    onProgress: { progress in hud.setProgress(progress) },
-                    overlayImage: { [recipe = self.recipe, images = self.overlayImages,
-                                     artwork = self.videoArtworkRenderer] size in
-                        // Rendered at the output resolution, so text stays crisp.
-                        artwork.render(drawing: recipe.drawing, overlays: recipe.overlays,
-                                       images: images, size: size)
-                    })
-                teardownVideo()
-                // Ownership passes to the host here, and only here.
-                onFinish?(.saved(output: .video(output), recipe: recipe))
-            } catch is CancellationError {
-                // Cancelled exports leave a partial file nobody will ever read.
-                try? FileManager.default.removeItem(at: output)
-                // Stay in the editor; the user cancelled.
-            } catch {
-                try? FileManager.default.removeItem(at: output)
-                let alert = UIAlertController(title: L10n.exportFailedTitle,
-                                              message: error.localizedDescription, preferredStyle: .alert)
-                alert.addAction(UIAlertAction(title: L10n.ok, style: .default))
-                present(alert, animated: true)
-            }
-        }
-    }
-
     // MARK: - Draw mode
 
     @objc private func drawTapped() { enterDrawingMode() }
@@ -1421,32 +2075,28 @@ public final class MediaEditorViewController: UIViewController {
     /// paused video frame.
     public func enterDrawingMode() {
         guard mode == .normal else { return }
+        resetZoom()
         switch item {
         case .photo:
-            guard let source = previewSource else { return }
+            guard previewSource != nil else { return }
             mode = .draw
-            // Show the geometry image only; the canvas renders the strokes itself.
-            if let rendered = renderer.renderGeometry(cgImage: source, recipe: recipe) {
-                imageView.image = UIImage(cgImage: rendered)
-            }
         case .video:
             // No frame on screen yet means no canvas size to author against.
             guard !videoContainer.frame.isEmpty else { return }
             mode = .draw
             setPlaybackChromeHidden(true)
-            videoDrawingView.isHidden = true         // the canvas shows the strokes
         }
 
-        overlayContainer.deselect()
-        overlayContainer.isHidden = true
         topBar.isHidden = true
         setMainToolbarHidden(true)
         drawTopBar.isHidden = false
 
+        // The canvas takes the drawing's place among the stickers — over the
+        // picture ones, under the text — so every other edit stays in view.
         view.layoutIfNeeded()
-        canvasView.frame = view.convert(displayedImageFrame(), from: imageView)
+        overlayContainer.beginDrawing(with: canvasView)
         loadDrawingIntoCanvas()
-        view.addSubview(canvasView)
+        drawingAtEntry = canvasView.drawing
         view.bringSubviewToFront(drawTopBar)
 
         toolPicker.setVisible(true, forFirstResponder: canvasView)
@@ -1454,6 +2104,9 @@ public final class MediaEditorViewController: UIViewController {
         canvasView.becomeFirstResponder()
         UIAccessibility.post(notification: .screenChanged, argument: drawTitleLabel)
     }
+
+    /// The strokes as the pencil tool opened, to tell an edit from a look.
+    private var drawingAtEntry = PKDrawing()
 
     /// Loads the recipe's drawing into the canvas, scaling it from its authoring
     /// canvas to the current canvas size if they differ.
@@ -1478,11 +2131,16 @@ public final class MediaEditorViewController: UIViewController {
         var next = recipe
         if pkDrawing.bounds.isNull || pkDrawing.strokes.isEmpty {
             next.drawing = nil
+        } else if pkDrawing.dataRepresentation() == drawingAtEntry.dataRepresentation() {
+            // Opened and closed without a stroke: leave it where it stacks.
         } else {
+            // Fresh strokes go over every sticker already on the media; anything
+            // added afterwards lands on top of them.
             next.drawing = DrawingData(
                 data: pkDrawing.dataRepresentation(),
                 canvasWidth: Double(size.width),
-                canvasHeight: Double(size.height)
+                canvasHeight: Double(size.height),
+                zIndex: recipe.nextZIndex
             )
         }
         exitDrawingMode()
@@ -1498,13 +2156,11 @@ public final class MediaEditorViewController: UIViewController {
         toolPicker.setVisible(false, forFirstResponder: canvasView)
         toolPicker.removeObserver(canvasView)
         canvasView.resignFirstResponder()
-        canvasView.removeFromSuperview()
+        overlayContainer.endDrawing()
         mode = .normal
         if case .video = item {
             setPlaybackChromeHidden(false)
-            videoDrawingView.isHidden = false
         }
-        overlayContainer.isHidden = false
         topBar.isHidden = false
         setMainToolbarHidden(false)
         drawTopBar.isHidden = true
@@ -1518,6 +2174,7 @@ public final class MediaEditorViewController: UIViewController {
     /// Enters the filters carousel with a live preview.
     public func enterFilterMode() {
         guard sourceCGImage != nil, mode == .normal else { return }
+        resetZoom()
         mode = .filter
         filterWorkingFilter = recipe.filter
 
@@ -1531,18 +2188,14 @@ public final class MediaEditorViewController: UIViewController {
         UIAccessibility.post(notification: .screenChanged, argument: filterTitleLabel)
     }
 
-    /// Preview with the working filter (geometry + filter + drawing; overlays stay
-    /// as live views on top).
+    /// Preview with the working filter (geometry + filter; the drawing and
+    /// overlays stay as live layers on top).
     private func renderFilterPreview() {
         guard let source = previewSource else { return }
         var r = recipe
         r.filter = filterWorkingFilter
         guard let rendered = renderer.renderGeometry(cgImage: source, recipe: r) else { return }
-        var image = UIImage(cgImage: rendered)
-        if let drawing = r.drawing {
-            image = drawingCompositor.composite(base: image, drawing: drawing)
-        }
-        imageView.image = image
+        imageView.image = UIImage(cgImage: rendered)
     }
 
     /// Renders a small thumbnail of the geometry-applied image for each filter.
@@ -1595,13 +2248,20 @@ public final class MediaEditorViewController: UIViewController {
 
     // MARK: - Overlays (stickers)
 
+    /// Stickers need media on the canvas: a decoded photo or a video.
+    private var canAddOverlays: Bool {
+        !isPassthrough && (item.kind == .video || sourceCGImage != nil)
+    }
+
     private func addText() {
+        guard canAddOverlays else { return }
         presentTextEditor(seed: TextStyle(string: "")) { [weak self] style in
             self?.insertOverlay(content: .text(style), image: nil)
         }
     }
 
     private func addPhoto() {
+        guard canAddOverlays else { return }
         var config = PHPickerConfiguration()
         config.filter = .images
         config.selectionLimit = 1
@@ -1611,7 +2271,11 @@ public final class MediaEditorViewController: UIViewController {
     }
 
     private func presentTextEditor(seed: TextStyle, completion: @escaping (TextStyle) -> Void) {
-        let editor = TextEditorViewController(style: seed, appearance: appearance) { style in
+        // The text editor brings up the keyboard, which would lift the caption
+        // bar into view behind its translucent backdrop.
+        bottomAccessory?.isHidden = true
+        let editor = TextEditorViewController(style: seed, appearance: appearance) { [weak self] style in
+            if let self, mode == .normal { bottomAccessory?.isHidden = false }
             guard let style else { return }
             completion(style)
         }
@@ -1620,7 +2284,8 @@ public final class MediaEditorViewController: UIViewController {
 
     /// Appends a new overlay centered on the canvas, on top of the stack.
     private func insertOverlay(content: OverlayContent, image: UIImage?) {
-        let nextZ = (recipe.overlays.map(\.zIndex).max() ?? -1) + 1
+        // Above everything already placed, the drawing included.
+        let nextZ = recipe.nextZIndex
         if case let .image(ref) = content, let image { overlayImages[ref.id] = image }
         let overlay = Overlay(content: content, transform: .identity, zIndex: nextZ)
         var next = recipe
@@ -1667,19 +2332,19 @@ public final class MediaEditorViewController: UIViewController {
     @objc private func rotateTapped() {
         var next = recipe
         next.rotation.rotateClockwise90()
-        apply(next)
+        applyGeometry(next)
     }
 
     @objc private func flipHTapped() {
         var next = recipe
         next.flip.horizontal.toggle()
-        apply(next)
+        applyGeometry(next)
     }
 
     @objc private func flipVTapped() {
         var next = recipe
         next.flip.vertical.toggle()
-        apply(next)
+        applyGeometry(next)
     }
 
     @objc private func addTextTapped() { addText() }
@@ -1715,7 +2380,13 @@ public final class MediaEditorViewController: UIViewController {
     /// collapses them into one "+" menu, but a custom row is free to surface
     /// them however it likes.
     public var toolbarActions: [EditorAction] {
-        let tools = configuration.tools(for: item.kind)
+        guard !isPassthrough else { return [] }
+        return actions(for: item.kind)
+    }
+
+    /// The tool-row actions `configuration` offers for `kind`.
+    private func actions(for kind: MediaKind) -> [EditorAction] {
+        let tools = configuration.tools(for: kind)
         var actions: [EditorAction] = []
         if tools.contains(.crop) {
             actions.append(.crop)
@@ -1735,6 +2406,8 @@ public final class MediaEditorViewController: UIViewController {
     /// action the configuration doesn't offer — it simply does nothing when the
     /// underlying tool is unavailable.
     public func perform(_ action: EditorAction) {
+        // Passthrough content has nothing to edit.
+        if isPassthrough, ![.undo, .redo, .cancel, .done].contains(action) { return }
         switch action {
         case .crop:           enterCropMode()
         case .rotate:         rotateTapped()
@@ -1755,6 +2428,7 @@ public final class MediaEditorViewController: UIViewController {
     /// Whether `action` can be run right now — undo/redo depend on history, the
     /// audio toggle on the source actually having a track.
     public func isEnabled(_ action: EditorAction) -> Bool {
+        if isPassthrough, ![.cancel, .done].contains(action) { return false }
         switch action {
         case .undo:        return history.canUndo
         case .redo:        return history.canRedo
@@ -1776,6 +2450,19 @@ public final class MediaEditorViewController: UIViewController {
         default:           return false
         }
     }
+
+    /// Whether a tool — crop, drawing or filters — has the screen.
+    public var isToolActive: Bool { mode != .normal }
+
+    // Internal so tests can check what the session holds in memory.
+    /// The selected photo is decoded at full size.
+    var hasFullSizeDecode: Bool { sourceCGImage != nil }
+    /// A video player is loaded.
+    var hasVideoPlayer: Bool { player != nil }
+    /// The thumbnail strip, for a session.
+    var strip: ThumbnailStripView? { isSingleItemEditor ? nil : thumbnailStrip }
+    /// An export is running.
+    var isExporting: Bool { exportTask != nil }
 
     public func undo() {
         if let state = history.undo() {
@@ -1806,20 +2493,845 @@ public final class MediaEditorViewController: UIViewController {
         overlayContainer.reload(overlays: recipe.overlays, images: overlayImages)
     }
 
+    // MARK: - Session
+
+    /// Points the editor at the selected item's media: decodes a photo held in
+    /// memory, notes a video's URL, or marks passthrough content. The views
+    /// follow in `loadSelectedMediaViews()` once there is a view to put them in.
+    private func prepareSelectedMedia() {
+        let selected = items[selectedIndex]
+        isPassthrough = false
+        sourceImage = nil
+        sourceCGImage = nil
+        previewSourceCGImage = nil
+        previewSourceCap = 0
+        switch selected.source {
+        case let .photo(image):
+            let normalized = image.normalizedUp()
+            sourceImage = normalized
+            sourceCGImage = normalized.cgImage
+            item = .photo(image)
+        case .photoFile:
+            // Decoded off the main actor when shown; nothing to edit until then.
+            item = .photo(UIImage())
+        case let .video(url):
+            item = .video(url)
+        case .passthrough:
+            item = .photo(UIImage())
+            isPassthrough = true
+        }
+        // Restore image-overlay content from a resumed recipe.
+        for overlay in selected.recipe.overlays {
+            if case let .image(ref) = overlay.content, overlayImages[ref.id] == nil,
+               let data = ref.data, let image = UIImage(data: data) {
+                overlayImages[ref.id] = image
+            }
+        }
+    }
+
+    /// Puts the selected media on the canvas.
+    private func loadSelectedMediaViews() {
+        switch items[selectedIndex].source {
+        case .photo:
+            break                                    // rendered by the layout pass
+        case let .photoFile(url):
+            loadPhotoFile(url: url)
+        case let .video(url):
+            loadVideo(url: url)
+        case let .passthrough(_, preview):
+            let content = preview()
+            content.translatesAutoresizingMaskIntoConstraints = false
+            // Like `imageView`, the content fills whatever the chrome leaves. A
+            // hosting view reports its SwiftUI content's ideal size — a few
+            // points for a document viewer — and at default priorities that
+            // ties with the accessory, so Auto Layout could squash the canvas
+            // and stretch the bar instead.
+            for axis in [NSLayoutConstraint.Axis.horizontal, .vertical] {
+                content.setContentHuggingPriority(.init(1), for: axis)
+                content.setContentCompressionResistancePriority(.init(1), for: axis)
+            }
+            passthroughHost.addSubview(content)
+            NSLayoutConstraint.activate([
+                content.leadingAnchor.constraint(equalTo: passthroughHost.leadingAnchor),
+                content.trailingAnchor.constraint(equalTo: passthroughHost.trailingAnchor),
+                content.topAnchor.constraint(equalTo: passthroughHost.topAnchor),
+                content.bottomAnchor.constraint(equalTo: passthroughHost.bottomAnchor),
+            ])
+            passthroughView = content
+            passthroughHost.isHidden = false
+            overlayContainer.isHidden = true
+        }
+    }
+
+    /// Decodes a photo file at full size off the main actor. Until it lands,
+    /// the strip's thumbnail stands in, scaled up, so the switch feels instant —
+    /// it already shows the edits, so the live sticker layer waits for the
+    /// real image.
+    private func loadPhotoFile(url: URL) {
+        let id = selectedItemID
+        imageView.image = pagePreview(for: id)
+        overlayContainer.isHidden = true
+        photoLoadTask = Task { @MainActor [weak self] in
+            let decoded = await Task.detached(priority: .userInitiated) {
+                EditRenderer.decodeUpright(url: url, maxPixelSize: nil)
+            }.value
+            guard let self, !Task.isCancelled, selectedItemID == id, let decoded else { return }
+            let image = UIImage(cgImage: decoded)
+            sourceImage = image
+            sourceCGImage = decoded
+            item = .photo(image)
+            previewSourceCap = 0
+            overlayContainer.isHidden = false
+            view.setNeedsLayout()
+            view.layoutIfNeeded()
+            refreshPreviewSourceIfNeeded()
+            renderPreview()
+            reloadOverlaysFromRecipe()
+            notifyToolbarStateChanged()
+        }
+    }
+
+    /// Takes the selected item's media off the canvas and lets go of its
+    /// full-size decode.
+    private func unloadSelectedMedia() {
+        photoLoadTask?.cancel()
+        photoLoadTask = nil
+        if player != nil || videoAsset != nil { unloadVideo() }
+        passthroughView?.removeFromSuperview()
+        passthroughView = nil
+        passthroughHost.isHidden = true
+        overlayContainer.deselect()
+        overlayContainer.isHidden = false
+        imageView.image = nil
+    }
+
+    /// Whether the selected item's media is a photo, a video, or not editable.
+    private var selectedKind: MediaKind? { isPassthrough ? nil : item.kind }
+
+    /// Shows item `id` on the canvas. Its edits and undo history are as the
+    /// user left them; whatever was selected keeps its own. An open tool is
+    /// cancelled first.
+    public func select(_ id: UUID) {
+        guard id != selectedItemID, items.contains(where: { $0.id == id }) else { return }
+        switchSelection(to: id)
+        onSelectionChange?(id)
+    }
+
+    private func switchSelection(to id: UUID) {
+        abandonPaging()
+        resetZoom()
+        switch mode {
+        case .crop:   cancelCropTapped()
+        case .draw:   cancelDrawTapped()
+        case .filter: cancelFilterTapped()
+        case .normal: break
+        }
+        histories[selectedItemID] = history
+        if isViewLoaded { unloadSelectedMedia() }
+        let previousKind = selectedKind
+
+        selectedItemID = id
+        let selected = items[selectedIndex]
+        isLoadingSelection = true
+        history = histories.removeValue(forKey: id)
+            ?? EditHistory(initial: selected.recipe, limit: configuration.historyLimit)
+        prepareSelectedMedia()
+        recipe = history.current
+        isLoadingSelection = false
+
+        guard isViewLoaded else { return }
+        if selectedKind != previousKind { rebuildToolRows() }
+        loadSelectedMediaViews()
+        reloadOverlaysFromRecipe()
+        updateDrawingLayer()
+        updateHistoryButtons()
+        refreshMainChrome()
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        renderPreview()
+        updateStrip()
+    }
+
+    /// Removes item `id` from the session. Removing the selected item selects
+    /// its neighbour; removing the last one ends the session with `.cancelled`.
+    public func remove(_ id: UUID) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        guard items.count > 1 else {
+            items.removeAll()
+            histories.removeAll()
+            onItemsChange?(items)
+            endSession(.cancelled)
+            return
+        }
+        let removingSelected = id == selectedItemID
+        if removingSelected {
+            switchSelection(to: items[index + 1 < items.count ? index + 1 : index - 1].id)
+        }
+        items.remove(at: index)
+        histories[id] = nil
+        thumbnailRecipes[id] = nil
+        thumbnailQueue.removeAll { $0 == id }
+        if isViewLoaded { updateStrip() }
+        onItemsChange?(items)
+        if removingSelected { onSelectionChange?(selectedItemID) }
+    }
+
+    /// Adds items to the session — at `index`, or at the end — and selects the
+    /// first of them. Items already in the session are skipped.
+    public func insert(_ newItems: [MediaEditorItem], at index: Int? = nil) {
+        let fresh = newItems.filter { new in !items.contains { $0.id == new.id } }
+        guard let first = fresh.first else { return }
+        let position = min(max(0, index ?? items.count), items.count)
+        items.insert(contentsOf: fresh, at: position)
+        if isViewLoaded { updateStrip() }
+        onItemsChange?(items)
+        select(first.id)
+    }
+
+    /// Moves an item within the strip.
+    private func moveItem(from source: Int, to destination: Int) {
+        guard items.indices.contains(source), items.indices.contains(destination), source != destination else { return }
+        let moved = items.remove(at: source)
+        items.insert(moved, at: destination)
+        if isViewLoaded { updateStrip() }
+        onItemsChange?(items)
+    }
+
+    /// Rebuilds the tool rows for the selected media — photos and videos offer
+    /// different tools.
+    private func rebuildToolRows() {
+        if customToolbar == nil {
+            toolRow.arrangedSubviews.forEach { $0.removeFromSuperview() }
+            audioButtonHost = nil
+            for button in toolbarButtons() { toolRow.addArrangedSubview(button) }
+        }
+        cropToolsBar.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        for button in cropToolButtons() { cropToolsBar.addArrangedSubview(button) }
+        notifyToolbarStateChanged()
+    }
+
+    /// The actions a custom row is offered in a session: those of every kind of
+    /// media in it, so the row can serve whichever item is selected.
+    private var sessionToolbarActions: [EditorAction] {
+        let kinds = Set(items.compactMap(\.source.kind))
+        let all = kinds.flatMap { actions(for: $0) }
+        return EditorAction.allCases.filter { all.contains($0) }
+    }
+
+    // MARK: - Strip
+
+    /// Adds the thumbnail strip, directly above the accessory, for a session.
+    private func setupStrip() {
+        guard !isSingleItemEditor else { return }
+        thumbnailStrip.delegate = self
+        thumbnailStrip.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(thumbnailStrip)
+        NSLayoutConstraint.activate([
+            thumbnailStrip.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            thumbnailStrip.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            thumbnailStrip.heightAnchor.constraint(equalToConstant: ThumbnailStripView.height(for: appearance)),
+            // Rides on the accessory, so a strip left up with the keyboard
+            // stays attached to the bar.
+            thumbnailStrip.bottomAnchor.constraint(equalTo: bottomAccessory?.topAnchor ?? accessoryGuide.topAnchor),
+        ])
+        updateStrip()
+    }
+
+    /// Refreshes the strip's cells and whether it's on screen, and queues
+    /// thumbnails it doesn't have yet.
+    private func updateStrip() {
+        guard !isSingleItemEditor, isViewLoaded, !items.isEmpty else { return }
+        stripIsInUse = items.count >= 2 || onAddItems != nil
+        thumbnailStrip.showsAddCell = onAddItems != nil
+        thumbnailStrip.update(items: items, selectedID: selectedItemID)
+        stripHeightConstraint?.constant = stripIsInUse ? ThumbnailStripView.height(for: appearance) : 0
+        applyStripVisibility(animated: view.window != nil)
+        for item in items where thumbnailRecipes[item.id] != item.recipe { enqueueThumbnail(item.id) }
+        prefetchPagePreviews()
+    }
+
+    /// Fades the strip in or out: shown while it's in use, no tool is open, and
+    /// — unless the appearance says otherwise — the keyboard is down. Its space
+    /// stays reserved either way, so the media doesn't move.
+    private func applyStripVisibility(animated: Bool) {
+        guard !isSingleItemEditor, isViewLoaded else { return }
+        let visible = stripIsInUse && !isToolOpen
+            && !(isKeyboardUp && appearance.hidesThumbnailStripWithKeyboard)
+        thumbnailStrip.isUserInteractionEnabled = visible
+        if visible { thumbnailStrip.isHidden = false }
+        let changes = { [weak self] in
+            guard let self else { return }
+            thumbnailStrip.alpha = visible ? 1 : 0
+            view.layoutIfNeeded()
+        }
+        let completion: (Bool) -> Void = { [weak self] _ in
+            guard let self, thumbnailStrip.alpha == 0 else { return }
+            thumbnailStrip.isHidden = true
+        }
+        if animated {
+            UIView.animate(withDuration: 0.2, animations: changes, completion: completion)
+        } else {
+            changes()
+            completion(true)
+        }
+    }
+
+    /// Re-renders an item's thumbnail once its edits settle.
+    private func scheduleThumbnailRefresh(for id: UUID) {
+        guard !isSingleItemEditor else { return }
+        thumbnailDebounce?.cancel()
+        thumbnailDebounce = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            self?.enqueueThumbnail(id)
+        }
+    }
+
+    private func enqueueThumbnail(_ id: UUID) {
+        guard !isSingleItemEditor else { return }
+        if !thumbnailQueue.contains(id) { thumbnailQueue.append(id) }
+        pumpThumbnails()
+    }
+
+    /// Renders queued thumbnails one at a time, so a large session never holds
+    /// more than one decode at once.
+    private func pumpThumbnails() {
+        guard thumbnailTask == nil, !thumbnailQueue.isEmpty else { return }
+        let id = thumbnailQueue.removeFirst()
+        guard let item = items.first(where: { $0.id == id }) else { pumpThumbnails(); return }
+        let maxPixelSize = appearance.thumbnailSize * max(1, traitCollection.displayScale)
+        let images = overlayImages.merging(editRenderer.stickerImages(for: item.recipe)) { cached, _ in cached }
+        thumbnailTask = Task { @MainActor [weak self] in
+            guard let renderer = self?.editRenderer else { return }
+            let image = await renderer.thumbnail(for: item, maxPixelSize: maxPixelSize, images: images)
+            var duration: Double?
+            if case let .video(url) = item.source {
+                let total = (try? await AVURLAsset(url: url).load(.duration))?.seconds
+                duration = item.recipe.trim?.duration ?? total
+            }
+            guard let self, !Task.isCancelled else { return }
+            thumbnailTask = nil
+            if items.contains(where: { $0.id == id }) {
+                thumbnailRecipes[id] = item.recipe
+                thumbnailStrip.setThumbnail(image, duration: duration, for: id)
+                // Edited again while this one rendered.
+                if items.first(where: { $0.id == id })?.recipe != item.recipe { enqueueThumbnail(id) }
+            }
+            pumpThumbnails()
+        }
+    }
+
+    // MARK: - Zoom
+
+    /// How far the media is magnified, and where it has been moved to, in
+    /// points from where it sits unzoomed. The image view and the sticker
+    /// layer carry it as one transform, so the edits zoom with the media.
+    private(set) var zoomScale: CGFloat = 1
+    private var zoomOffset: CGPoint = .zero
+    private static let maximumZoom: CGFloat = 4
+    /// Where the pinch's fingers were last, from the canvas centre.
+    private var pinchAnchor: CGPoint?
+    /// Whether the drag in progress pans zoomed-in media rather than paging.
+    private var panMovesZoom = false
+
+    /// Whether the media is zoomed in.
+    var isZoomed: Bool { zoomScale > 1.01 }
+
+    /// Photos and videos zoom in the main mode. Passthrough content is the
+    /// host's own view, with its own gestures.
+    private var canZoom: Bool { mode == .normal && !isPassthrough && paging == nil }
+
+    private func applyZoom() {
+        let transform = CGAffineTransform(translationX: zoomOffset.x, y: zoomOffset.y)
+            .scaledBy(x: zoomScale, y: zoomScale)
+        imageView.transform = transform
+        overlayContainer.transform = transform
+        updateCanvasPan()
+    }
+
+    /// Zoomed in, a drag pans in any direction; otherwise it pages, where the
+    /// session allows it.
+    private func updateCanvasPan() {
+        let pan = overlayContainer.canvasPan
+        pan.pagesItems = !isZoomed
+        pan.isEnabled = isZoomed || allowsPaging
+    }
+
+    /// `point` in the view, measured from the unzoomed canvas centre.
+    private func fromCanvasCenter(_ point: CGPoint) -> CGPoint {
+        CGPoint(x: point.x - imageView.center.x, y: point.y - imageView.center.y)
+    }
+
+    private func handleCanvasPinch(_ pinch: UIPinchGestureRecognizer) {
+        guard canZoom || pinchAnchor != nil else { return }
+        let location = fromCanvasCenter(pinch.location(in: view))
+        switch pinch.state {
+        case .began:
+            pinchAnchor = location
+        case .changed:
+            // A finger lifted mid-pinch moves the centroid; start over from
+            // the one left rather than jump.
+            guard let anchor = pinchAnchor, pinch.numberOfTouches >= 2 else {
+                pinchAnchor = location
+                return
+            }
+            // Keeps the media point under the fingers there as they spread
+            // and move. A little give past the limits; `settleZoom` takes it
+            // back.
+            let scale = min(max(zoomScale * pinch.scale, 0.7), Self.maximumZoom * 1.25)
+            let content = CGPoint(x: (anchor.x - zoomOffset.x) / zoomScale,
+                                  y: (anchor.y - zoomOffset.y) / zoomScale)
+            zoomOffset = CGPoint(x: location.x - content.x * scale, y: location.y - content.y * scale)
+            zoomScale = scale
+            pinch.scale = 1
+            pinchAnchor = location
+            applyZoom()
+        default:
+            pinchAnchor = nil
+            settleZoom(animated: true)
+        }
+    }
+
+    private func handleZoomPan(_ pan: UIPanGestureRecognizer) {
+        switch pan.state {
+        case .changed:
+            let translation = pan.translation(in: view)
+            pan.setTranslation(.zero, in: view)
+            guard pinchAnchor == nil else { return }       // the pinch moves it
+            zoomOffset.x += translation.x
+            zoomOffset.y += translation.y
+            applyZoom()
+        case .ended:
+            // Carried on a little by the flick, then kept inside the media.
+            let velocity = pan.velocity(in: view)
+            zoomOffset.x += velocity.x * 0.15
+            zoomOffset.y += velocity.y * 0.15
+            settleZoom(animated: true)
+        case .cancelled, .failed:
+            settleZoom(animated: true)
+        default:
+            break
+        }
+    }
+
+    /// Zooms in on the double-tapped spot, or back out. `location` is in the
+    /// sticker layer. Internal so tests can zoom without a real touch.
+    func handleCanvasDoubleTap(at location: CGPoint) {
+        guard canZoom else { return }
+        if isZoomed {
+            resetZoom(animated: true)
+            return
+        }
+        // The sticker layer isn't transformed yet, so this is from the centre.
+        let point = CGPoint(x: location.x - overlayContainer.bounds.midX,
+                            y: location.y - overlayContainer.bounds.midY)
+        zoomScale = 2.5
+        zoomOffset = CGPoint(x: -point.x * zoomScale, y: -point.y * zoomScale)
+        settleZoom(animated: true)
+    }
+
+    /// Brings the zoom back within its limits — no smaller than fitting, no
+    /// bigger than `maximumZoom`, and no further aside than the media's own
+    /// edges — and sharpens a photo for the magnification it lands on.
+    private func settleZoom(animated: Bool) {
+        zoomScale = min(max(zoomScale, 1), Self.maximumZoom)
+        if zoomScale <= 1.01 {
+            zoomScale = 1
+            zoomOffset = .zero
+        } else {
+            zoomOffset = clampedZoomOffset(zoomOffset, scale: zoomScale)
+        }
+        let changes: () -> Void = { [weak self] in self?.applyZoom() }
+        if animated {
+            UIView.animate(withDuration: 0.3, delay: 0, usingSpringWithDamping: 1, initialSpringVelocity: 0,
+                           options: [.allowUserInteraction, .beginFromCurrentState], animations: changes)
+        } else {
+            changes()
+        }
+        if refreshPreviewSourceIfNeeded() { renderPreview() }
+    }
+
+    /// The offset nearest `offset` that keeps the zoomed media covering the
+    /// preview area, or centred along an axis where it's narrower than it.
+    private func clampedZoomOffset(_ offset: CGPoint, scale: CGFloat) -> CGPoint {
+        let bounds = imageView.bounds
+        let media = displayedImageFrame()
+        func clamp(_ value: CGFloat, low: CGFloat, high: CGFloat, half: CGFloat) -> CGFloat {
+            if high - low <= 2 * half { return -(low + high) / 2 }
+            return min(max(value, half - high), -half - low)
+        }
+        return CGPoint(
+            x: clamp(offset.x, low: (media.minX - bounds.midX) * scale, high: (media.maxX - bounds.midX) * scale,
+                     half: bounds.width / 2),
+            y: clamp(offset.y, low: (media.minY - bounds.midY) * scale, high: (media.maxY - bounds.midY) * scale,
+                     half: bounds.height / 2))
+    }
+
+    /// Back to fitting the preview area.
+    func resetZoom(animated: Bool = false) {
+        pinchAnchor = nil
+        guard zoomScale != 1 || zoomOffset != .zero else { return }
+        zoomScale = 1
+        zoomOffset = .zero
+        settleZoom(animated: animated)
+    }
+
+    // MARK: - Paging
+
+    /// A page turn between items, tab-view style: a track over the canvas
+    /// holding a still of the selected item flanked by its neighbours, which
+    /// follows the finger and settles on a page. The live canvas stays put
+    /// underneath and only switches once the turn lands.
+    private struct Paging {
+        /// Covers the live canvas — it stays put, so the canvas never shows
+        /// at an edge the moving pages have left.
+        let cover: UIView
+        /// The pages, side by side; this is what moves.
+        let track: UIView
+        /// The pages on the track, keyed by their offset from the selected item.
+        let pages: [Int: UUID]
+        let pageWidth: CGFloat
+        /// Whether the video was playing when the turn began, to resume it if
+        /// the turn springs back.
+        let resumesPlayback: Bool
+        /// The finger is still on it; once it lets go — or for a strip tap,
+        /// from the start — the track is animating and a new drag leaves it be.
+        var isTracking: Bool
+    }
+
+    /// Whether a page turn is under way — for tests.
+    var isPaging: Bool { paging != nil }
+
+    /// Whether a drag on the canvas may turn pages at all.
+    private var allowsPaging: Bool { !isSingleItemEditor && appearance.allowsSwipeBetweenItems }
+
+    /// A one-finger drag on empty canvas pans zoomed-in media, and otherwise
+    /// turns the page.
+    private func handleCanvasPan(_ pan: UIPanGestureRecognizer) {
+        if pan.state == .began { panMovesZoom = isZoomed }
+        if panMovesZoom {
+            handleZoomPan(pan)
+        } else {
+            handlePagingPan(pan)
+        }
+    }
+
+    @objc private func handlePagingPan(_ pan: UIPanGestureRecognizer) {
+        switch pan.state {
+        case .began:
+            beginPaging()
+        case .changed:
+            updatePaging(translation: pan.translation(in: view).x)
+        case .ended:
+            endPaging(velocity: pan.velocity(in: view).x)
+        case .cancelled, .failed:
+            endPaging(velocity: 0, cancelled: true)
+        default:
+            break
+        }
+    }
+
+    /// Lays the track over the canvas with the selected item's neighbours on
+    /// either side. Internal so tests can turn pages without a real touch.
+    func beginPaging() {
+        guard paging == nil else { return }
+        let index = selectedIndex
+        var pages: [Int: UUID] = [:]
+        for offset in [-1, 1] where items.indices.contains(index + offset) {
+            pages[offset] = items[index + offset].id
+        }
+        startPaging(pages: pages, tracking: true)
+    }
+
+    /// Moves the track with the finger; past the first or last item it gives
+    /// way only grudgingly.
+    func updatePaging(translation: CGFloat) {
+        guard let paging, paging.isTracking else { return }
+        let offset = translation < 0 ? 1 : -1
+        let x = paging.pages[offset] == nil ? translation * 0.3 : translation
+        paging.track.transform = CGAffineTransform(translationX: x, y: 0)
+    }
+
+    /// Settles the turn: on the neighbour when the drag — carried on by its
+    /// speed — passed halfway, otherwise back where it started.
+    func endPaging(velocity: CGFloat, cancelled: Bool = false) {
+        guard let paging, paging.isTracking else { return }
+        let x = paging.track.transform.tx
+        let projected = x + velocity * 0.2
+        var offset = 0
+        if !cancelled, abs(projected) > paging.pageWidth / 2 {
+            let candidate = projected < 0 ? 1 : -1
+            if paging.pages[candidate] != nil { offset = candidate }
+        }
+        settlePaging(on: offset, velocity: velocity)
+    }
+
+    /// Selects a strip tap's target straight away — the strip and
+    /// `onSelectionChange` follow at once — and slides it in over the canvas
+    /// from the side it sits on, whichever item it is.
+    private func turnPage(to id: UUID) {
+        guard id != selectedItemID, let target = items.firstIndex(where: { $0.id == id }) else { return }
+        let offset = target > selectedIndex ? 1 : -1
+        guard view.window != nil, startPaging(pages: [offset: id], tracking: false), let paging else {
+            select(id)
+            return
+        }
+        // The track is on its own from here: the selection it shows has
+        // already happened underneath.
+        self.paging = nil
+        select(id)
+        UIView.animate(withDuration: 0.35, delay: 0, usingSpringWithDamping: 1,
+                       initialSpringVelocity: 0, options: [.allowUserInteraction]) {
+            paging.track.transform = CGAffineTransform(translationX: -CGFloat(offset) * paging.pageWidth, y: 0)
+        } completion: { [weak self] _ in
+            self?.retire(paging.cover)
+        }
+    }
+
+    @discardableResult
+    private func startPaging(pages: [Int: UUID], tracking: Bool) -> Bool {
+        guard paging == nil, mode == .normal, items.count > 1, !imageView.bounds.isEmpty else { return false }
+        resetZoom()
+        overlayContainer.deselect()
+        let wasPlaying = isVideoPlaying
+        if wasPlaying {
+            player?.pause()
+            syncTransport(animated: false)
+        }
+
+        // An opaque cover hides the live canvas, which would otherwise show
+        // through wherever the pages have moved off; it sits below the
+        // chrome, which stays where it is. The pages move on a track over it.
+        let cover = UIView(frame: view.bounds)
+        cover.backgroundColor = view.backgroundColor
+        cover.isUserInteractionEnabled = false
+        let track = UIView(frame: cover.bounds)
+        cover.addSubview(track)
+        let pageWidth = view.bounds.width
+        let canvas = [imageView, passthroughHost, overlayContainer].filter { !$0.isHidden }
+        for live in canvas {
+            guard let still = live.snapshotView(afterScreenUpdates: false) else { continue }
+            still.frame = live.frame
+            track.addSubview(still)
+        }
+        for (offset, id) in pages {
+            let page = pageView(for: id)
+            page.frame = pageFrame(for: id).offsetBy(dx: CGFloat(offset) * pageWidth, dy: 0)
+            track.addSubview(page)
+        }
+        view.insertSubview(cover, aboveSubview: overlayContainer)
+        setVideoControlsFaded(true)
+        paging = Paging(cover: cover, track: track, pages: pages, pageWidth: pageWidth, resumesPlayback: wasPlaying,
+                        isTracking: tracking)
+        return true
+    }
+
+    /// Animates the track onto the page `offset` from the selected item — `0`
+    /// springs back — and selects that page's item once it lands.
+    private func settlePaging(on offset: Int, velocity: CGFloat) {
+        self.paging?.isTracking = false
+        guard let paging else { return }
+        let target = -CGFloat(offset) * paging.pageWidth
+        let distance = target - paging.track.transform.tx
+        let springVelocity = abs(distance) > 1 ? velocity / distance : 0
+        UIView.animate(withDuration: 0.35, delay: 0, usingSpringWithDamping: 1,
+                       initialSpringVelocity: springVelocity, options: [.allowUserInteraction]) {
+            paging.track.transform = CGAffineTransform(translationX: target, y: 0)
+        } completion: { [weak self] _ in
+            guard let self, self.paging?.cover === paging.cover else { return }
+            guard let id = paging.pages[offset] else {
+                self.abandonPaging()
+                if paging.resumesPlayback {
+                    self.player?.play()
+                    self.syncTransport(animated: false)
+                }
+                return
+            }
+            self.paging = nil
+            self.select(id)
+            self.retire(paging.cover)
+        }
+    }
+
+    /// Fades a landed turn off the canvas it now matches. It keeps covering
+    /// the new item for a moment while it loads — a video's first frame takes
+    /// one.
+    private func retire(_ cover: UIView) {
+        setVideoControlsFaded(false)
+        UIView.animate(withDuration: 0.2, delay: 0.05, options: [.allowUserInteraction]) {
+            cover.alpha = 0
+        } completion: { _ in
+            cover.removeFromSuperview()
+        }
+    }
+
+    /// Drops a page turn on the spot, leaving the canvas as it is.
+    private func abandonPaging() {
+        guard let paging else { return }
+        self.paging = nil
+        paging.track.layer.removeAllAnimations()
+        paging.cover.removeFromSuperview()
+        setVideoControlsFaded(false)
+    }
+
+    /// The transport, filmstrip and readout belong to the item on the canvas,
+    /// so they step out of a page turn and come back with whatever it lands on.
+    private func setVideoControlsFaded(_ faded: Bool) {
+        UIView.animate(withDuration: faded ? 0.15 : 0.2, delay: 0, options: [.allowUserInteraction, .beginFromCurrentState]) {
+            for control in [self.playPauseButton, self.trimScrubber, self.timeLabel] as [UIView] {
+                control.alpha = faded ? 0 : 1
+            }
+        }
+    }
+
+    /// Where item `id` sits when it's on the canvas, in the view: the preview
+    /// area, or for a video the box above its controls — the same box
+    /// `videoPreviewBounds` fits the player into, worked out even before any
+    /// video has put its controls on screen.
+    private func pageFrame(for id: UUID) -> CGRect {
+        let area = imageView.frame
+        guard let item = items.first(where: { $0.id == id }), case .video = item.source else { return area }
+        let controlsTop: CGFloat
+        if timeLabel.superview != nil, timeLabel.frame.height > 0 {
+            controlsTop = timeLabel.frame.minY
+        } else {
+            controlsTop = bottomChromeTopY - Self.timeLabelBottomGap - Self.timeLabelHeight
+                - (offersTrim ? Self.filmstripBottomGap + Self.filmstripHeight : 0)
+        }
+        let limit = controlsTop - Self.videoControlsGap
+        guard limit > area.minY, limit < area.maxY else { return area }
+        return CGRect(x: area.minX, y: area.minY, width: area.width, height: limit - area.minY)
+    }
+
+    /// Where `bottomChromeTopAnchor` is, in the view.
+    private var bottomChromeTopY: CGFloat {
+        if appearance.toolbarPlacement == .bottom, let toolRowContainer {
+            let row = toolRowContainer === toolRowBackground ? toolRow : toolRowContainer
+            return view.convert(row.bounds, from: row).minY
+        }
+        if let floatingDoneButton { return floatingDoneButton.frame.minY }
+        return bottomChromeGuide.layoutFrame.minY
+    }
+
+    /// What a page turn shows for item `id`: the host's own view for
+    /// passthrough content without a thumbnail — a document has nothing else
+    /// to show — and otherwise the best picture on hand.
+    private func pageView(for id: UUID) -> UIView {
+        if let item = items.first(where: { $0.id == id }),
+           case let .passthrough(thumbnail, preview) = item.source, thumbnail == nil {
+            return preview()
+        }
+        let page = UIImageView(image: pagePreview(for: id))
+        page.contentMode = .scaleAspectFit
+        return page
+    }
+
+    /// The best picture of item `id` on hand: its screen-sized render, or else
+    /// its strip thumbnail.
+    private func pagePreview(for id: UUID) -> UIImage? {
+        pagePreviews[id]?.image ?? thumbnailStrip.thumbnail(for: id)
+    }
+
+    /// Renders the selected item's neighbours at screen size, one at a time,
+    /// and forgets everyone else's.
+    private func prefetchPagePreviews() {
+        guard !isSingleItemEditor, isViewLoaded else { return }
+        let index = selectedIndex
+        let neighbours = [index - 1, index + 1].filter(items.indices.contains).map { items[$0] }
+        let wanted = Set(neighbours.map(\.id))
+        pagePreviews = pagePreviews.filter { wanted.contains($0.key) }
+        let stale = neighbours.filter { pagePreviews[$0.id]?.recipe != $0.recipe }
+        pagePreviewTask?.cancel()
+        guard !stale.isEmpty else { pagePreviewTask = nil; return }
+        let size = imageView.bounds.isEmpty ? view.bounds.size : imageView.bounds.size
+        let maxPixelSize = max(size.width, size.height) * max(1, traitCollection.displayScale)
+        let renderer = editRenderer
+        let jobs = stale.map { item in
+            (item, overlayImages.merging(renderer.stickerImages(for: item.recipe)) { cached, _ in cached })
+        }
+        pagePreviewTask = Task { @MainActor [weak self] in
+            for (item, images) in jobs {
+                let image = await renderer.thumbnail(for: item, maxPixelSize: maxPixelSize, images: images)
+                guard let self, !Task.isCancelled else { return }
+                if let image { pagePreviews[item.id] = (item.recipe, image) }
+            }
+        }
+    }
+
+    /// Stops everything the editor runs in the background: pauses playback,
+    /// invalidates the display link, cancels an in-flight export (its partial
+    /// file is removed) and puts away the PencilKit tool picker.
+    ///
+    /// Call it when the editor leaves the screen for good — `MediaEditorView`
+    /// does so when SwiftUI removes it. Ending a session does it too.
+    public func tearDown() {
+        exportTask?.cancel()
+        thumbnailTask?.cancel()
+        thumbnailTask = nil
+        thumbnailDebounce?.cancel()
+        pagePreviewTask?.cancel()
+        pagePreviewTask = nil
+        abandonPaging()
+        photoLoadTask?.cancel()
+        videoLoadTask?.cancel()
+        teardownVideo()
+        if mode == .draw {
+            toolPicker.setVisible(false, forFirstResponder: canvasView)
+            toolPicker.removeObserver(canvasView)
+        }
+    }
+
+    /// Ends the session, reporting through whichever handler the editor was
+    /// created with.
+    private func endSession(_ result: MediaEditorSessionResult) {
+        tearDown()
+        if isSingleItemEditor {
+            switch result {
+            case .cancelled:
+                onFinish?(.cancelled)
+            case let .saved(results):
+                guard let first = results.first, let output = first.output else { onFinish?(.cancelled); return }
+                onFinish?(.saved(output: output, recipe: first.item.recipe))
+            }
+        } else {
+            onSessionFinish?(result)
+        }
+    }
+
     // MARK: - Session end
 
     /// Cancels the session without saving.
     public func cancel() {
-        teardownVideo()
-        onFinish?(.cancelled)
+        endSession(.cancelled)
     }
 
-    /// Renders the current recipe and finishes with the result.
+    /// Confirms the edits.
     ///
-    /// Photos render synchronously through `PhotoRenderer`. Videos export
-    /// asynchronously through `VideoComposer` behind a progress panel, with the
-    /// drawing and overlays burned in; `onFinish` fires once the file is ready.
+    /// A single-item editor renders and reports through `onFinish`: photos
+    /// synchronously, videos exported behind a progress panel with the drawing
+    /// and overlays burned in. A multi-item session follows
+    /// `EditorConfiguration.finishMode` — rendering every edited item behind
+    /// the panel, or handing back the recipes straight away. Either way the
+    /// output is exactly what ``EditRenderer`` produces.
+    ///
+    /// Cancelling the panel returns to the editor. If a render fails, an alert
+    /// says so, anything already rendered for the session is deleted, and the
+    /// user stays in the editor to try again.
     public func finish() {
+        guard exportTask == nil else { return }              // already rendering
+        if isSingleItemEditor {
+            finishSingleItem()
+            return
+        }
+        switch configuration.finishMode {
+        case .recipesOnly:
+            endSession(.saved(items.map { MediaEditorItemResult(item: $0, output: nil) }))
+        case .render:
+            renderSession()
+        }
+    }
+
+    private func finishSingleItem() {
         switch item {
         case .photo:
             guard let sourceCGImage,
@@ -1827,15 +3339,104 @@ public final class MediaEditorViewController: UIViewController {
                 onFinish?(.cancelled)
                 return
             }
-            var base = UIImage(cgImage: rendered)
-            if let drawing = recipe.drawing {
-                base = drawingCompositor.composite(base: base, drawing: drawing)
-            }
-            let output = overlayCompositor.composite(base: base, overlays: recipe.overlays, images: overlayImages)
+            let output = editRenderer.composite(base: UIImage(cgImage: rendered), recipe: recipe, images: overlayImages)
             onFinish?(.saved(output: .photo(output), recipe: recipe))
         case .video:
-            exportVideo()
+            renderSession()
         }
+    }
+
+    /// Renders every item that has edits, one after another, behind the
+    /// progress panel — never in parallel, which would multiply peak memory.
+    private func renderSession() {
+        // Don't leave the preview running behind the export panel.
+        player?.pause()
+        syncTransport(animated: false)
+        let snapshot = items
+        let pending = snapshot.filter { item in
+            // A single-item editor always renders; a session skips what has
+            // nothing to render.
+            item.source.isEditable && (isSingleItemEditor || !item.recipe.isIdentity)
+        }
+        guard !pending.isEmpty else {
+            endSession(.saved(snapshot.map { MediaEditorItemResult(item: $0, output: nil) }))
+            return
+        }
+
+        let hud = ExportProgressView(appearance: appearance)
+        hud.translatesAutoresizingMaskIntoConstraints = false
+        hud.onCancel = { [weak self] in self?.exportTask?.cancel() }
+        view.addSubview(hud)
+        NSLayoutConstraint.activate([
+            hud.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            hud.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            hud.topAnchor.constraint(equalTo: view.topAnchor),
+            hud.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        ])
+
+        exportTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var outputs: [UUID: EditorOutput] = [:]
+            do {
+                for (step, item) in pending.enumerated() {
+                    try Task.checkCancellation()
+                    let report: (Float) -> Void = { progress in
+                        if pending.count == 1 {
+                            hud.setProgress(progress)
+                        } else {
+                            hud.setProgress((Float(step) + progress) / Float(pending.count),
+                                            item: step + 1, of: pending.count)
+                        }
+                    }
+                    report(0)
+                    let images = overlayImages.merging(editRenderer.stickerImages(for: item.recipe)) { cached, _ in cached }
+                    if item.id == selectedItemID, item.source.kind == .photo, let sourceCGImage {
+                        // Already decoded for editing — don't decode it twice.
+                        outputs[item.id] = .photo(try await editRenderer.renderPhoto(
+                            upright: sourceCGImage, recipe: item.recipe, images: images))
+                    } else {
+                        outputs[item.id] = try await editRenderer.render(
+                            source: item.source, recipe: item.recipe, images: images, onProgress: report)
+                    }
+                    report(1)
+                }
+                hud.removeFromSuperview()
+                exportTask = nil
+                // Ownership of video files passes to the host here, and only here.
+                endSession(.saved(snapshot.map { MediaEditorItemResult(item: $0, output: outputs[$0.id]) }))
+            } catch {
+                hud.removeFromSuperview()
+                exportTask = nil
+                // Whatever was rendered before the failure is thrown away; the
+                // next attempt renders everything again.
+                for case let .video(url) in outputs.values { try? FileManager.default.removeItem(at: url) }
+                guard !(error is CancellationError) else { return }      // stay; the user cancelled
+                let alert = UIAlertController(title: L10n.exportFailedTitle,
+                                              message: error.localizedDescription, preferredStyle: .alert)
+                alert.addAction(UIAlertAction(title: L10n.ok, style: .default))
+                present(alert, animated: true)
+            }
+        }
+    }
+}
+
+// MARK: - Thumbnail strip delegate
+
+extension MediaEditorViewController: ThumbnailStripDelegate {
+    func thumbnailStrip(_ strip: ThumbnailStripView, didSelect id: UUID) {
+        turnPage(to: id)
+    }
+
+    func thumbnailStrip(_ strip: ThumbnailStripView, didRemove id: UUID) {
+        remove(id)
+    }
+
+    func thumbnailStrip(_ strip: ThumbnailStripView, didMoveItemFrom source: Int, to destination: Int) {
+        moveItem(from: source, to: destination)
+    }
+
+    func thumbnailStripDidTapAdd(_ strip: ThumbnailStripView) {
+        onAddItems?()
     }
 }
 
@@ -1843,6 +3444,9 @@ public final class MediaEditorViewController: UIViewController {
 
 extension MediaEditorViewController: OverlayContainerDelegate {
     func overlayContainerDidCommit(_ container: OverlayContainerView) {
+        // In crop mode the container shows the edits carried onto the whole
+        // frame; a gesture that began before must not write those back.
+        guard mode != .crop else { return }
         var next = recipe
         next.overlays = container.currentOverlays()
         apply(next)
@@ -1852,7 +3456,14 @@ extension MediaEditorViewController: OverlayContainerDelegate {
     /// paused state once the transport has faded out. A tap that merely clears a
     /// sticker selection is left alone, so dismissing a selection doesn't also
     /// stop the video.
+    ///
+    /// While the accessory is being typed into, a tap on the media only puts the
+    /// keyboard away, the way a chat composer behaves.
     func overlayContainer(_ container: OverlayContainerView, didTapCanvasWithSelection hadSelection: Bool) {
+        if let bottomAccessory, bottomAccessory.containsFirstResponder {
+            bottomAccessory.endEditing(true)
+            return
+        }
         guard case .video = item, mode == .normal, !hadSelection else { return }
         togglePlayback()
     }
@@ -1880,6 +3491,13 @@ extension MediaEditorViewController: OverlayContainerDelegate {
     }
 }
 
+private extension UIView {
+    /// Whether this view or anything inside it holds the keyboard.
+    var containsFirstResponder: Bool {
+        isFirstResponder || subviews.contains { $0.containsFirstResponder }
+    }
+}
+
 // MARK: - Filter bar delegate
 
 extension MediaEditorViewController: FilterBarDelegate {
@@ -1893,12 +3511,14 @@ extension MediaEditorViewController: FilterBarDelegate {
 
 extension MediaEditorViewController: RotationDialDelegate {
     func rotationDial(_ dial: RotationDialView, didChangeTo degrees: Double) {
+        cropAdjustmentBegan()
         cropStraighten = degrees
         renderCropPreview()
         cropOverlay.reset()   // keep the frame filling the clean inscribed area
     }
 
     func rotationDialDidCommit(_ dial: RotationDialView) {
+        cropAdjustmentEnded()
         // The angle is committed to the recipe on Apply.
     }
 }

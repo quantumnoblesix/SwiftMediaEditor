@@ -84,7 +84,7 @@ struct OverlayContainerViewTests {
         let spy = ContainerSpy()
         container.delegate = spy
         container.reload(overlays: [text("A")], images: [:])
-        let sticker = try #require(container.subviews.compactMap { $0 as? StickerView }.first)
+        let sticker = try #require(container.layeredViews.compactMap { $0 as? StickerView }.first)
         return (container, sticker, spy)
     }
 

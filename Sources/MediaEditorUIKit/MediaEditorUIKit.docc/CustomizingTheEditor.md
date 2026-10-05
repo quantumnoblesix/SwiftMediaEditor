@@ -1,16 +1,21 @@
 # Customizing the Editor
 
-Restyle the built-in chrome, or replace its tool row with your own.
+Restyle the built-in chrome, lay it out like a chat app with your own bottom
+bar, or replace its tool row with your own.
 
 ## Overview
 
-The chrome has three groups: Cancel and an undo/redo pill at the top leading
-edge, Done at the top trailing edge, and a single centered row of tools at the
-bottom.
+By default the chrome has three groups: Cancel and an undo/redo pill at the top
+leading edge, Done at the top trailing edge, and a single centered row of tools
+at the bottom. Undo and redo appear once there is something to undo. The editor
+is always dark, whatever the system appearance, and so is everything it presents
+and anything the host puts in it.
 
-Customization comes in two tiers. ``EditorAppearance`` restyles what the editor
-draws — tints, glyphs, and a per-button hook. ``MediaEditorToolbarProviding``
-replaces the tool row outright, while the editor keeps providing the behavior.
+``EditorAppearance`` restyles what the editor draws — tints, glyphs, a
+per-button hook, and where the tool row sits. A bottom accessory adds a bar of
+your own, such as a caption field and a send button.
+``MediaEditorToolbarProviding`` replaces the tool row outright, while the editor
+keeps providing the behavior.
 
 ### Restyle the chrome
 
@@ -22,6 +27,8 @@ appearance.symbols[.crop] = "crop"       // swap any action's SF Symbol
 appearance.destructive = .systemPink     // the sticker delete bin
 appearance.trimColor = .systemGreen      // the video trimmer; nil follows accent
 appearance.prefersLiquidGlass = false    // one look on every OS version
+appearance.toolbarPlacement = .top       // tools in the top bar, or .bottom
+appearance.toolbarStyle = .circularButtons   // a circle per tool, or .floatingBar
 appearance.styleToolButton = { button, action in
     button.layer.cornerRadius = 8        // runs after the built-in styling
 }
@@ -29,6 +36,26 @@ appearance.styleToolButton = { button, action in
 
 Pass the appearance when you create the editor — ``MediaEditorViewController``
 and `MediaEditorView` both take an `appearance` argument.
+
+### Lay it out like a chat app
+
+``EditorAppearance/messaging`` puts an ✕ and a circular button per tool across
+the top, leaving the bottom for a bar of your own. Pass that bar as the
+`bottomAccessory`. It spans the full width and runs under the home indicator,
+so lay its content out against its `safeAreaLayoutGuide`; the editor lifts it
+with the keyboard and hides it while a tool is open. With an accessory
+installed the editor shows no Done button, so call
+``MediaEditorViewController/finish()`` from your send action:
+
+```swift
+let editor = MediaEditorViewController(item: .photo(image),
+                                       appearance: .messaging,
+                                       bottomAccessory: captionBar)
+captionBar.onSend = { [weak editor] in editor?.finish() }
+```
+
+`MediaEditorView` takes a `bottomAccessory` view builder instead, which
+receives a `MediaEditorProxy` for driving the editor from SwiftUI.
 
 ### Replace the tool row
 

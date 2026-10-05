@@ -94,6 +94,13 @@ final class ExportProgressView: UIView {
         label.text = L10n.exportProgress(percent: Int(progress * 100))
     }
 
+    /// Progress across a multi-item save: the bar covers the whole session,
+    /// the label says which item is being rendered.
+    func setProgress(_ progress: Float, item: Int, of count: Int) {
+        progressView.setProgress(progress, animated: true)
+        label.text = L10n.exportProgress(item: item, of: count)
+    }
+
     @objc private func cancelTapped() {
         onCancel?()
     }

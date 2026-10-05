@@ -25,15 +25,25 @@ use the same editor through `MediaEditorView`, and the model it edits lives in
 - ``EditorResult``
 - ``EditorOutput``
 
+### Multi-item sessions
+
+- ``MediaEditorItem``
+- ``MediaSource``
+- ``MediaEditorItemResult``
+- ``MediaEditorSessionResult``
+
 ### Customizing the editor
 
 - <doc:CustomizingTheEditor>
 - ``EditorAppearance``
+- ``EditorToolbarPlacement``
+- ``EditorToolbarStyle``
 - ``MediaEditorToolbarProviding``
 - ``EditorAction``
 - ``EditorBarButtonRole``
 
 ### Rendering outside the editor
 
+- ``EditRenderer``
 - ``OverlayCompositor``
 - ``DrawingCompositor``

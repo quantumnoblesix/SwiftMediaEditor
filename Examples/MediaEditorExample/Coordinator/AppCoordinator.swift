@@ -16,6 +16,7 @@ enum Route: Hashable {
     case editorChoice
     case standardEditor
     case brandedEditor
+    case chatEditor
     case customOptions
     case customEditor
     case result
@@ -29,6 +30,8 @@ final class MediaSession: ObservableObject {
     /// The recipe of the last save, used to resume editing when coming back.
     @Published var recipe: EditRecipe = .identity
     @Published private(set) var result: MediaResult?
+    /// Every result of a multi-item send, in order — `result` is the first.
+    @Published private(set) var results: [MediaResult] = []
     /// How many times the media has been saved — the "kept track of" count.
     @Published private(set) var editCount = 0
     /// Tools the user enabled for the custom editor via the checklist.
@@ -38,10 +41,21 @@ final class MediaSession: ObservableObject {
         self.source = source
         recipe = .identity
         result = nil
+        results = []
         editCount = 0
     }
 
+    /// Records the results of a multi-item send. There's no single recipe to
+    /// resume from, so coming back to editing starts afresh.
+    func record(results: [MediaResult]) {
+        self.result = results.first
+        self.results = results
+        recipe = .identity
+        editCount += 1
+    }
+
     func record(result: MediaResult, recipe: EditRecipe) {
+        self.results = [result]
         self.result = result
         self.recipe = recipe
         editCount += 1
@@ -67,6 +81,7 @@ final class AppCoordinator: ObservableObject {
         switch kind {
         case .standard: path.append(.standardEditor)
         case .branded:  path.append(.brandedEditor)
+        case .chat:     path.append(.chatEditor)
         case .custom:   path.append(.customOptions)
         }
     }
@@ -80,6 +95,12 @@ final class AppCoordinator: ObservableObject {
     /// Editing saved → record the result and present the final preview.
     func finishEditing(result: MediaResult, recipe: EditRecipe) {
         session.record(result: result, recipe: recipe)
+        path.append(.result)
+    }
+
+    /// A multi-item send finished rendering → present every result.
+    func finishSending(results: [MediaResult]) {
+        session.record(results: results)
         path.append(.result)
     }
 

@@ -15,8 +15,10 @@
 import UIKit
 import MediaEditorCore
 
-/// Renders what a video export lays over its frames: the recipe's drawing, then
-/// its overlays, on a transparent canvas the size of the output frame.
+/// Renders what a video export lays over its frames — the overlays under the
+/// drawing, the strokes, then the overlays over it (see
+/// `EditRecipe.overlayLayers`) — on a transparent canvas the size of the output
+/// frame.
 ///
 /// It goes through the same compositors as a photo save, at the same pixel
 /// scale, so text size, sticker placement and stroke width follow the same rules
@@ -42,9 +44,11 @@ struct VideoArtworkRenderer {
         // strokes and text don't need more than.
         format.preferredRange = .standard
         let bounds = CGRect(origin: .zero, size: size)
+        let layers = EditRecipe(drawing: drawing, overlays: overlays).overlayLayers
         return UIGraphicsImageRenderer(size: size, format: format).image { context in
+            overlayCompositor.draw(layers.belowDrawing, in: context.cgContext, canvas: size, images: images)
             strokes?.draw(in: bounds)
-            overlayCompositor.draw(overlays, in: context.cgContext, canvas: size, images: images)
+            overlayCompositor.draw(layers.aboveDrawing, in: context.cgContext, canvas: size, images: images)
         }.cgImage
     }
 }

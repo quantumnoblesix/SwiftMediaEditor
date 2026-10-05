@@ -192,6 +192,24 @@ struct VideoExportTests {
         return CGSize(width: abs(rect.width), height: abs(rect.height))
     }
 
+    @Test("Cancelling as the export starts throws CancellationError instead of crashing")
+    func cancelAtStart() async throws {
+        let source = try await makeFixture(width: 320, height: 240, seconds: 2, fps: 15)
+        defer { try? FileManager.default.removeItem(at: source) }
+        let output = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MediaEditor-cancel-\(UUID().uuidString).mp4")
+        defer { try? FileManager.default.removeItem(at: output) }
+
+        // Cancelled before the session starts: AVFoundation used to raise an
+        // Objective-C exception here, taking the app down.
+        let task = Task { @MainActor in
+            try await composer.export(asset: AVURLAsset(url: source),
+                                      recipe: EditRecipe(rotation: RotationState(degrees: 90)), to: output)
+        }
+        task.cancel()
+        await #expect(throws: CancellationError.self) { try await task.value }
+    }
+
     @Test("Exports a rotated, trimmed clip with swapped dimensions and clipped duration")
     func exportRotateAndTrim() async throws {
         let source = try await makeFixture(width: 160, height: 120, seconds: 2, fps: 15)

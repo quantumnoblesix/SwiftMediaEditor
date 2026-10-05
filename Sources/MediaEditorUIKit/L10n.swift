@@ -31,7 +31,9 @@ enum L10n {
         "tool.crop.title", "tool.draw.title", "tool.filters.title",
         "crop.aspect.free", "crop.aspect.original",
         "overlay.add.text", "overlay.add.photo",
-        "export.failed.title", "export.progress",
+        "export.failed.title", "export.progress", "export.progress.multi",
+        "strip.add", "strip.remove", "strip.move.left", "strip.move.right",
+        "strip.item.photo", "strip.item.video", "strip.item.other",
         "filter.original", "filter.vivid", "filter.mono", "filter.noir",
         "filter.fade", "filter.chrome", "filter.sepia", "filter.invert",
         "a11y.straighten", "a11y.crop.area", "a11y.crop.size", "a11y.move.up",
@@ -107,6 +109,26 @@ enum L10n {
     static var exportFailedTitle: String { string("export.failed.title", "Alert title when export fails") }
 
     /// Export progress, e.g. "Exporting… 42%".
+    static func exportProgress(item: Int, of count: Int) -> String {
+        String(format: string("export.progress.multi", "Multi-item export progress; item number, then item count"),
+               item, count)
+    }
+
+    // Thumbnail strip
+    static var stripAdd: String { string("strip.add", "Adds more media to the session") }
+    static var stripRemove: String { string("strip.remove", "Removes the item from the session") }
+    static var stripMoveLeft: String { string("strip.move.left", "Moves the item one place earlier") }
+    static var stripMoveRight: String { string("strip.move.right", "Moves the item one place later") }
+    static func stripItem(kind: MediaKind?, index: Int, count: Int) -> String {
+        let key: String
+        switch kind {
+        case .photo: key = "strip.item.photo"
+        case .video: key = "strip.item.video"
+        case nil:    key = "strip.item.other"
+        }
+        return String(format: string(key, "A thumbnail's label; its position, then the item count"), index, count)
+    }
+
     static func exportProgress(percent: Int) -> String {
         String(format: string("export.progress", "Export progress; %d is the percentage"), percent)
     }

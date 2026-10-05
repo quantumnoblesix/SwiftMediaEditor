@@ -26,6 +26,14 @@
 "export.failed.title" = "Échec de l’exportation";
 /* Export progress; %d is the percentage. French typography puts a space before % */
 "export.progress" = "Exportation… %d %%";
+"export.progress.multi" = "Exportation %d sur %d";
+"strip.add" = "Ajouter des médias";
+"strip.remove" = "Supprimer";
+"strip.move.left" = "Déplacer avant";
+"strip.move.right" = "Déplacer après";
+"strip.item.photo" = "Photo %d sur %d";
+"strip.item.video" = "Vidéo %d sur %d";
+"strip.item.other" = "Élément %d sur %d";
 
 /* Title of the filters tool */
 "tool.filters.title" = "Filtres";
