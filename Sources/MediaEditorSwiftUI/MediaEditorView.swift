@@ -41,14 +41,43 @@ import MediaEditorUIKit
 ///     CaptionBar(text: $caption) { editor.finish() }
 /// }
 /// ```
-public struct MediaEditorView<BottomAccessory: View>: UIViewControllerRepresentable {
+public struct MediaEditorView: UIViewControllerRepresentable {
     private let item: MediaItem
     private let recipe: EditRecipe
     private let configuration: EditorConfiguration
     private let appearance: EditorAppearance
     private weak var toolbarProvider: (any MediaEditorToolbarProviding)?
     private let onFinish: (EditorResult) -> Void
-    private let bottomAccessory: ((MediaEditorProxy) -> BottomAccessory)?
+    /// Type-erased, so `MediaEditorView` stays a plain type whether or not
+    /// it carries an accessory.
+    private let bottomAccessory: ((MediaEditorProxy) -> AnyView)?
+
+    /// - Parameters:
+    ///   - item: the photo or video to edit.
+    ///   - recipe: a recipe to resume from, or `.identity` for a fresh session.
+    ///   - configuration: the tools offered for photos and videos, the crop
+    ///     presets, and the export settings.
+    ///   - appearance: how the built-in chrome is styled.
+    ///   - toolbarProvider: supplies a replacement tool row. Held weakly, so
+    ///     keep your own reference — a `@State` object on the hosting view.
+    ///   - onFinish: called with the result when the user saves or cancels. The
+    ///     editor never dismisses itself, so end the presentation here.
+    public init(
+        item: MediaItem,
+        recipe: EditRecipe = .identity,
+        configuration: EditorConfiguration = .default,
+        appearance: EditorAppearance = .default,
+        toolbarProvider: (any MediaEditorToolbarProviding)? = nil,
+        onFinish: @escaping (EditorResult) -> Void
+    ) {
+        self.item = item
+        self.recipe = recipe
+        self.configuration = configuration
+        self.appearance = appearance
+        self.toolbarProvider = toolbarProvider
+        self.onFinish = onFinish
+        self.bottomAccessory = nil
+    }
 
     /// - Parameters:
     ///   - item: the photo or video to edit.
@@ -66,7 +95,7 @@ public struct MediaEditorView<BottomAccessory: View>: UIViewControllerRepresenta
     ///     while a `.background` still fills under it, so only add your own
     ///     padding. It is re-evaluated whenever this view updates, so it can
     ///     read and bind your state.
-    public init(
+    public init<BottomAccessory: View>(
         item: MediaItem,
         recipe: EditRecipe = .identity,
         configuration: EditorConfiguration = .default,
@@ -81,7 +110,7 @@ public struct MediaEditorView<BottomAccessory: View>: UIViewControllerRepresenta
         self.appearance = appearance
         self.toolbarProvider = toolbarProvider
         self.onFinish = onFinish
-        self.bottomAccessory = bottomAccessory
+        self.bottomAccessory = { AnyView(bottomAccessory($0)) }
     }
 
     public func makeUIViewController(context: Context) -> MediaEditorViewController {
@@ -133,36 +162,7 @@ public struct MediaEditorView<BottomAccessory: View>: UIViewControllerRepresenta
     public final class Coordinator {
         var onFinish: (EditorResult) -> Void = { _ in }
         fileprivate weak var controller: MediaEditorViewController?
-        fileprivate var accessoryHost: UIHostingController<DarkAccessory<BottomAccessory>>?
-    }
-}
-
-public extension MediaEditorView where BottomAccessory == EmptyView {
-    /// - Parameters:
-    ///   - item: the photo or video to edit.
-    ///   - recipe: a recipe to resume from, or `.identity` for a fresh session.
-    ///   - configuration: the tools offered for photos and videos, the crop
-    ///     presets, and the export settings.
-    ///   - appearance: how the built-in chrome is styled.
-    ///   - toolbarProvider: supplies a replacement tool row. Held weakly, so
-    ///     keep your own reference — a `@State` object on the hosting view.
-    ///   - onFinish: called with the result when the user saves or cancels. The
-    ///     editor never dismisses itself, so end the presentation here.
-    init(
-        item: MediaItem,
-        recipe: EditRecipe = .identity,
-        configuration: EditorConfiguration = .default,
-        appearance: EditorAppearance = .default,
-        toolbarProvider: (any MediaEditorToolbarProviding)? = nil,
-        onFinish: @escaping (EditorResult) -> Void
-    ) {
-        self.item = item
-        self.recipe = recipe
-        self.configuration = configuration
-        self.appearance = appearance
-        self.toolbarProvider = toolbarProvider
-        self.onFinish = onFinish
-        self.bottomAccessory = nil
+        fileprivate var accessoryHost: UIHostingController<DarkAccessory<AnyView>>?
     }
 }
 
@@ -184,7 +184,7 @@ struct DarkAccessory<Content: View>: View {
 public struct MediaEditorProxy {
     private let resolve: () -> MediaEditorViewController?
 
-    fileprivate init<A: View>(coordinator: MediaEditorView<A>.Coordinator) {
+    fileprivate init(coordinator: MediaEditorView.Coordinator) {
         resolve = { [weak coordinator] in coordinator?.controller }
     }
 
