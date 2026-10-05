@@ -6,6 +6,8 @@ All notable changes to this package are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-05
+
 ### Added
 
 #### Multi-item sessions
@@ -220,6 +222,7 @@ The first public release.
 - On native macOS only `MediaEditorCore` is available; the editor UI runs on the
   Mac through Mac Catalyst.
 
-[Unreleased]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.1.0...HEAD
+[Unreleased]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.2.0...HEAD
+[1.2.0]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.1.0...1.2.0
 [1.1.0]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.0.0...1.1.0
 [1.0.0]: https://github.com/quantumnoblesix/SwiftMediaEditor/releases/tag/1.0.0
