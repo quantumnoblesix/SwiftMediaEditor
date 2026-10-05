@@ -3,7 +3,7 @@
 A native, dependency-free media editor for iOS — edit **photos** and **videos**
 with the same non-destructive engine, usable from both **UIKit** and **SwiftUI**.
 
-> Current release: **1.2.0**. See the [changelog](CHANGELOG.md) for what's included.
+> Current release: **1.3.0**. See the [changelog](CHANGELOG.md) for what's included.
 
 ## Features
 
@@ -25,6 +25,8 @@ with the same non-destructive engine, usable from both **UIKit** and **SwiftUI**
 | Re-editing from a saved recipe | ✅ | ✅ |
 | Chat-style layout with your own caption / send bar | ✅ | ✅ |
 | Multi-item sessions with a thumbnail strip | ✅ | ✅ |
+| Drag between items, tab-view style | ✅ | ✅ |
+| Pinch / double-tap to zoom, with the edits zooming along | ✅ | ✅ |
 | Headless rendering that matches the editor's own save | ✅ | ✅ |
 
 Built entirely on Apple frameworks — Core Image, Core Graphics, PencilKit, and
@@ -183,8 +185,15 @@ MediaEditorView(items: $items, selection: $selection, configuration: configurati
   `selection` and the editor follows.
 - **The strip**: tap a thumbnail to switch; tap the selected one, then tap
   again, to remove it; an optional "+" cell calls `onAddItems`. Long-press to
-  reorder with `appearance.allowsReordering`; swipe on empty canvas to page
-  between items. Removing the last item ends the session with `.cancelled`.
+  reorder with `appearance.allowsReordering`. Removing the last item ends the
+  session with `.cancelled`.
+- **Paging**: drag on empty canvas to move between items, tab-view style — the
+  media follows the finger with its neighbour sliding in beside it, and settles
+  on whichever page the drag, or a flick, reaches. Strip taps slide in the same
+  way. Turn it off with `appearance.allowsSwipeBetweenItems`.
+- **Zoom**: pinch or double-tap to zoom a photo or video, up to 4×; stickers,
+  text and drawing zoom with it. Zoomed in, a one-finger drag pans instead of
+  paging. With a sticker selected, a pinch resizes the sticker.
 - **Finishing**: `.render` (the default) renders every edited item behind a
   progress panel; `.recipesOnly` hands back the recipes at once, for
   `EditRenderer` to render later. Either way each item comes back as a
@@ -254,7 +263,7 @@ see `BrandedToolbar.swift`.
 Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/quantumnoblesix/SwiftMediaEditor.git", from: "1.2.0")
+.package(url: "https://github.com/quantumnoblesix/SwiftMediaEditor.git", from: "1.3.0")
 ```
 
 then add the product to your target — SwiftPM names the package after the
@@ -475,6 +484,8 @@ swift test
    layered among the stickers
 10. ✅ Release 1.2.0 — multi-item sessions with a thumbnail strip, and
     `EditRenderer` for rendering edits in the background
+11. ✅ Release 1.3.0 — tab-view-style paging between items, pinch and
+    double-tap zoom, and passthrough content that keeps its full size
 
 Photos and videos are feature-complete. Video supports the crop tool (aspect
 presets, straighten dial, rotate/flip), drawing, text and stickers, timeline

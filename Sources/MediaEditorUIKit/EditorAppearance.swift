@@ -108,8 +108,10 @@ public struct EditorAppearance {
     public var hidesThumbnailStripWithKeyboard: Bool = true
     /// Let the user reorder items by long-pressing and dragging a thumbnail.
     public var allowsReordering: Bool = false
-    /// Let a horizontal swipe on empty canvas page to the next or previous item.
-    /// A swipe that starts on a sticker still moves the sticker.
+    /// Let a horizontal drag on empty canvas page to the next or previous item,
+    /// tab-view style: the media follows the finger with its neighbour sliding
+    /// in beside it, and settles on whichever page the drag — or a flick —
+    /// reaches. A drag that starts on a sticker still moves the sticker.
     public var allowsSwipeBetweenItems: Bool = true
     /// Applied to every strip cell after the built-in styling, with the item
     /// it shows and whether it's selected — to re-skin cells in place.

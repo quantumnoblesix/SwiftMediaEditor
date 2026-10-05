@@ -4,7 +4,38 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] - 2026-10-05
+
+### Added
+
+- Pinch to zoom on photos and videos, up to 4×, with stickers, text and
+  drawing zooming along. A one-finger drag pans zoomed media, a double tap
+  zooms in on the tapped spot or back out, and the media can't be moved past
+  its own edges. Photos re-render at the zoomed resolution so they stay sharp.
+  With a sticker selected, a pinch still resizes the sticker. Zoom resets on
+  switching items and on opening crop, drawing or filters. Passthrough content
+  keeps its own gestures. A single tap on the canvas now waits briefly to rule
+  out a double tap.
+
+### Changed
+
+- Moving between a session's items now pages tab-view style. Dragging on empty
+  canvas carries the media with the finger while the neighbouring item slides
+  in beside it, and the drag settles on the page it reaches past halfway, or
+  the next one for a flick. Past the first or last item it rubber-bands.
+  Tapping a strip thumbnail slides that item in from its side. The next and
+  previous items are rendered at screen size ahead of time, so they slide in
+  sharp. An incoming video slides in exactly where it will sit, and the
+  transport, filmstrip and time readout fade out for the turn and back in with
+  the item it lands on. `allowsSwipeBetweenItems` still turns the drag off.
+
+### Fixed
+
+- Passthrough content (a PDF, a GIF) no longer squashes the canvas to a few
+  points with the bottom accessory stretched over the freed space. A hosting
+  view reports its SwiftUI content's ideal size, and the canvas could lose to
+  it. Passthrough content now yields to the layout the way the image preview
+  does, and the accessory holds its content height.
 
 ## [1.2.0] - 2026-10-05
 
@@ -222,7 +253,7 @@ The first public release.
 - On native macOS only `MediaEditorCore` is available; the editor UI runs on the
   Mac through Mac Catalyst.
 
-[Unreleased]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.2.0...HEAD
+[1.3.0]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.2.0...1.3.0
 [1.2.0]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.1.0...1.2.0
 [1.1.0]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.0.0...1.1.0
 [1.0.0]: https://github.com/quantumnoblesix/SwiftMediaEditor/releases/tag/1.0.0

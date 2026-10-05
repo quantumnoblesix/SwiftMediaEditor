@@ -57,7 +57,7 @@ public final class MediaEditorViewController: UIViewController {
     /// The item on the canvas, with its current recipe.
     public var selectedItem: MediaEditorItem { items[selectedIndex] }
 
-    /// Called after the selection changes — a strip tap, a swipe, a removal or
+    /// Called after the selection changes — a strip tap, a page turn, a removal or
     /// `select(_:)`.
     public var onSelectionChange: ((UUID) -> Void)?
     /// Called after items are removed, reordered or inserted.
@@ -96,6 +96,12 @@ public final class MediaEditorViewController: UIViewController {
     /// The recipe each strip thumbnail was rendered for.
     private var thumbnailRecipes: [UUID: EditRecipe] = [:]
     private var thumbnailDebounce: Task<Void, Never>?
+    /// The page turn in progress, if any.
+    private var paging: Paging?
+    /// Screen-sized renders of the selected item's neighbours, so a page turn
+    /// slides in a sharp picture rather than a stretched strip thumbnail.
+    private var pagePreviews: [UUID: (recipe: EditRecipe, image: UIImage)] = [:]
+    private var pagePreviewTask: Task<Void, Never>?
     /// The rendering path shared with `EditRenderer`'s hosts.
     private lazy var editRenderer = EditRenderer(configuration: configuration)
 
@@ -475,7 +481,10 @@ public final class MediaEditorViewController: UIViewController {
         layoutVideoPreview()
         // Container shares the image view's frame, so the displayed-image rect
         // (in image-view bounds coordinates) maps directly to container bounds.
-        overlayContainer.frame = imageView.frame
+        // Bounds and centre rather than frame: while zoomed both views carry
+        // the same transform, and a frame would be the zoomed outline.
+        overlayContainer.bounds = imageView.bounds
+        overlayContainer.center = imageView.center
         syncOverlayCanvas()
         if mode == .crop {
             positionCropOverlay()
@@ -550,14 +559,14 @@ public final class MediaEditorViewController: UIViewController {
         overlayContainer.clipsToBounds = false
         view.addSubview(overlayContainer)
 
-        if !isSingleItemEditor, appearance.allowsSwipeBetweenItems {
-            overlayContainer.onSwipe = { [weak self] direction in self?.swipe(direction) }
-            for direction in [UISwipeGestureRecognizer.Direction.left, .right] {
-                let swipe = UISwipeGestureRecognizer(target: self, action: #selector(passthroughSwiped(_:)))
-                swipe.direction = direction
-                passthroughHost.addGestureRecognizer(swipe)
-            }
+        overlayContainer.onCanvasPan = { [weak self] pan in self?.handleCanvasPan(pan) }
+        overlayContainer.onCanvasPinch = { [weak self] pinch in self?.handleCanvasPinch(pinch) }
+        overlayContainer.onCanvasDoubleTap = { [weak self] location in self?.handleCanvasDoubleTap(at: location) }
+        if allowsPaging {
+            passthroughHost.addGestureRecognizer(
+                PagingPanGestureRecognizer(target: self, action: #selector(handlePagingPan(_:))))
         }
+        updateCanvasPan()
 
         loadSelectedMediaViews()
     }
@@ -757,6 +766,8 @@ public final class MediaEditorViewController: UIViewController {
         // the safe area, which the accessory handles itself.
         view.keyboardLayoutGuide.usesBottomSafeArea = false
         accessory.translatesAutoresizingMaskIntoConstraints = false
+        // Slack never goes to the bar, whatever the canvas's content reports.
+        accessory.setContentHuggingPriority(.defaultHigh + 1, for: .vertical)
         view.addSubview(accessory)
         // The bar's content height, above the safe area: resting, the bar also
         // covers the home-indicator strip; lifted by the keyboard it doesn't.
@@ -1133,7 +1144,9 @@ public final class MediaEditorViewController: UIViewController {
     private func refreshPreviewSourceIfNeeded() -> Bool {
         guard let sourceCGImage, isViewLoaded else { return false }
         let scale = view.window?.screen.scale ?? UIScreen.main.scale
-        let cap = (max(imageView.bounds.width, imageView.bounds.height) * scale).rounded()
+        // Zoomed in, the preview shows more pixels per point — up to the
+        // source's own, which the check below caps it at.
+        let cap = (max(imageView.bounds.width, imageView.bounds.height) * scale * zoomScale).rounded()
         guard cap > 0, abs(cap - previewSourceCap) > 1 else { return false }
         previewSourceCap = cap
 
@@ -1332,6 +1345,7 @@ public final class MediaEditorViewController: UIViewController {
     public func enterCropMode() {
         guard mode == .normal, cropSourceSize.width > 0, cropSourceSize.height > 0 else { return }
         if case .photo = item, sourceCGImage == nil { return }
+        resetZoom()
         mode = .crop
 
         // A still frame is what you compose a crop against, and the transport
@@ -1591,6 +1605,15 @@ public final class MediaEditorViewController: UIViewController {
 
     /// Whether the session offers the filmstrip for its videos.
     private var offersTrim: Bool { configuration.tools(for: .video).contains(.trim) }
+
+    // The video controls' layout, shared with the page turn, which has to
+    // know where a video will sit before its controls exist.
+    private static let filmstripHeight: CGFloat = 60
+    private static let filmstripBottomGap: CGFloat = 12
+    private static let timeLabelHeight: CGFloat = 16
+    private static let timeLabelBottomGap: CGFloat = 8
+    /// The space between the video's box and the controls under it.
+    private static let videoControlsGap: CGFloat = 12
     /// The transport, filmstrip and readout have been added to the view.
     private var hasVideoChrome = false
 
@@ -1609,8 +1632,8 @@ public final class MediaEditorViewController: UIViewController {
             NSLayoutConstraint.activate([
                 trimScrubber.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
                 trimScrubber.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
-                trimScrubber.bottomAnchor.constraint(equalTo: bottomChromeTopAnchor, constant: -12),
-                trimScrubber.heightAnchor.constraint(equalToConstant: 60),
+                trimScrubber.bottomAnchor.constraint(equalTo: bottomChromeTopAnchor, constant: -Self.filmstripBottomGap),
+                trimScrubber.heightAnchor.constraint(equalToConstant: Self.filmstripHeight),
             ])
         }
 
@@ -1639,8 +1662,8 @@ public final class MediaEditorViewController: UIViewController {
         NSLayoutConstraint.activate([
             timeLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             timeLabel.bottomAnchor.constraint(equalTo: offersTrim ? trimScrubber.topAnchor : bottomChromeTopAnchor,
-                                              constant: -8),
-            timeLabel.heightAnchor.constraint(equalToConstant: 16),
+                                              constant: -Self.timeLabelBottomGap),
+            timeLabel.heightAnchor.constraint(equalToConstant: Self.timeLabelHeight),
         ])
 
         displayLinkProxy.onTick = { [weak self] in
@@ -1884,7 +1907,7 @@ public final class MediaEditorViewController: UIViewController {
     private var videoPreviewBounds: CGRect {
         let box = imageView.bounds
         guard mode != .crop, let controls = videoControlsTop, controls.frame.height > 0 else { return box }
-        let limit = imageView.convert(controls.frame, from: view).minY - 12
+        let limit = imageView.convert(controls.frame, from: view).minY - Self.videoControlsGap
         guard limit > box.minY, limit < box.maxY else { return box }
         return CGRect(x: box.minX, y: box.minY, width: box.width, height: limit - box.minY)
     }
@@ -1978,6 +2001,7 @@ public final class MediaEditorViewController: UIViewController {
     /// paused video frame.
     public func enterDrawingMode() {
         guard mode == .normal else { return }
+        resetZoom()
         switch item {
         case .photo:
             guard previewSource != nil else { return }
@@ -2074,6 +2098,7 @@ public final class MediaEditorViewController: UIViewController {
     /// Enters the filters carousel with a live preview.
     public func enterFilterMode() {
         guard sourceCGImage != nil, mode == .normal else { return }
+        resetZoom()
         mode = .filter
         filterWorkingFilter = recipe.filter
 
@@ -2438,6 +2463,15 @@ public final class MediaEditorViewController: UIViewController {
         case let .passthrough(_, preview):
             let content = preview()
             content.translatesAutoresizingMaskIntoConstraints = false
+            // Like `imageView`, the content fills whatever the chrome leaves. A
+            // hosting view reports its SwiftUI content's ideal size — a few
+            // points for a document viewer — and at default priorities that
+            // ties with the accessory, so Auto Layout could squash the canvas
+            // and stretch the bar instead.
+            for axis in [NSLayoutConstraint.Axis.horizontal, .vertical] {
+                content.setContentHuggingPriority(.init(1), for: axis)
+                content.setContentCompressionResistancePriority(.init(1), for: axis)
+            }
             passthroughHost.addSubview(content)
             NSLayoutConstraint.activate([
                 content.leadingAnchor.constraint(equalTo: passthroughHost.leadingAnchor),
@@ -2457,7 +2491,7 @@ public final class MediaEditorViewController: UIViewController {
     /// real image.
     private func loadPhotoFile(url: URL) {
         let id = selectedItemID
-        imageView.image = thumbnailStrip.thumbnail(for: id)
+        imageView.image = pagePreview(for: id)
         overlayContainer.isHidden = true
         photoLoadTask = Task { @MainActor [weak self] in
             let decoded = await Task.detached(priority: .userInitiated) {
@@ -2506,6 +2540,8 @@ public final class MediaEditorViewController: UIViewController {
     }
 
     private func switchSelection(to id: UUID) {
+        abandonPaging()
+        resetZoom()
         switch mode {
         case .crop:   cancelCropTapped()
         case .draw:   cancelDrawTapped()
@@ -2633,6 +2669,7 @@ public final class MediaEditorViewController: UIViewController {
         stripHeightConstraint?.constant = stripIsInUse ? ThumbnailStripView.height(for: appearance) : 0
         applyStripVisibility(animated: view.window != nil)
         for item in items where thumbnailRecipes[item.id] != item.recipe { enqueueThumbnail(item.id) }
+        prefetchPagePreviews()
     }
 
     /// Fades the strip in or out: shown while it's in use, no tool is open, and
@@ -2706,17 +2743,441 @@ public final class MediaEditorViewController: UIViewController {
         }
     }
 
-    /// A swipe on empty canvas pages to the next or previous item.
-    private func swipe(_ direction: UISwipeGestureRecognizer.Direction) {
-        guard mode == .normal, items.count > 1 else { return }
-        let index = selectedIndex
-        let target = direction == .left ? index + 1 : index - 1
-        guard items.indices.contains(target) else { return }
-        select(items[target].id)
+    // MARK: - Zoom
+
+    /// How far the media is magnified, and where it has been moved to, in
+    /// points from where it sits unzoomed. The image view and the sticker
+    /// layer carry it as one transform, so the edits zoom with the media.
+    private(set) var zoomScale: CGFloat = 1
+    private var zoomOffset: CGPoint = .zero
+    private static let maximumZoom: CGFloat = 4
+    /// Where the pinch's fingers were last, from the canvas centre.
+    private var pinchAnchor: CGPoint?
+    /// Whether the drag in progress pans zoomed-in media rather than paging.
+    private var panMovesZoom = false
+
+    /// Whether the media is zoomed in.
+    var isZoomed: Bool { zoomScale > 1.01 }
+
+    /// Photos and videos zoom in the main mode. Passthrough content is the
+    /// host's own view, with its own gestures.
+    private var canZoom: Bool { mode == .normal && !isPassthrough && paging == nil }
+
+    private func applyZoom() {
+        let transform = CGAffineTransform(translationX: zoomOffset.x, y: zoomOffset.y)
+            .scaledBy(x: zoomScale, y: zoomScale)
+        imageView.transform = transform
+        overlayContainer.transform = transform
+        updateCanvasPan()
     }
 
-    @objc private func passthroughSwiped(_ gesture: UISwipeGestureRecognizer) {
-        swipe(gesture.direction)
+    /// Zoomed in, a drag pans in any direction; otherwise it pages, where the
+    /// session allows it.
+    private func updateCanvasPan() {
+        let pan = overlayContainer.canvasPan
+        pan.pagesItems = !isZoomed
+        pan.isEnabled = isZoomed || allowsPaging
+    }
+
+    /// `point` in the view, measured from the unzoomed canvas centre.
+    private func fromCanvasCenter(_ point: CGPoint) -> CGPoint {
+        CGPoint(x: point.x - imageView.center.x, y: point.y - imageView.center.y)
+    }
+
+    private func handleCanvasPinch(_ pinch: UIPinchGestureRecognizer) {
+        guard canZoom || pinchAnchor != nil else { return }
+        let location = fromCanvasCenter(pinch.location(in: view))
+        switch pinch.state {
+        case .began:
+            pinchAnchor = location
+        case .changed:
+            // A finger lifted mid-pinch moves the centroid; start over from
+            // the one left rather than jump.
+            guard let anchor = pinchAnchor, pinch.numberOfTouches >= 2 else {
+                pinchAnchor = location
+                return
+            }
+            // Keeps the media point under the fingers there as they spread
+            // and move. A little give past the limits; `settleZoom` takes it
+            // back.
+            let scale = min(max(zoomScale * pinch.scale, 0.7), Self.maximumZoom * 1.25)
+            let content = CGPoint(x: (anchor.x - zoomOffset.x) / zoomScale,
+                                  y: (anchor.y - zoomOffset.y) / zoomScale)
+            zoomOffset = CGPoint(x: location.x - content.x * scale, y: location.y - content.y * scale)
+            zoomScale = scale
+            pinch.scale = 1
+            pinchAnchor = location
+            applyZoom()
+        default:
+            pinchAnchor = nil
+            settleZoom(animated: true)
+        }
+    }
+
+    private func handleZoomPan(_ pan: UIPanGestureRecognizer) {
+        switch pan.state {
+        case .changed:
+            let translation = pan.translation(in: view)
+            pan.setTranslation(.zero, in: view)
+            guard pinchAnchor == nil else { return }       // the pinch moves it
+            zoomOffset.x += translation.x
+            zoomOffset.y += translation.y
+            applyZoom()
+        case .ended:
+            // Carried on a little by the flick, then kept inside the media.
+            let velocity = pan.velocity(in: view)
+            zoomOffset.x += velocity.x * 0.15
+            zoomOffset.y += velocity.y * 0.15
+            settleZoom(animated: true)
+        case .cancelled, .failed:
+            settleZoom(animated: true)
+        default:
+            break
+        }
+    }
+
+    /// Zooms in on the double-tapped spot, or back out. `location` is in the
+    /// sticker layer. Internal so tests can zoom without a real touch.
+    func handleCanvasDoubleTap(at location: CGPoint) {
+        guard canZoom else { return }
+        if isZoomed {
+            resetZoom(animated: true)
+            return
+        }
+        // The sticker layer isn't transformed yet, so this is from the centre.
+        let point = CGPoint(x: location.x - overlayContainer.bounds.midX,
+                            y: location.y - overlayContainer.bounds.midY)
+        zoomScale = 2.5
+        zoomOffset = CGPoint(x: -point.x * zoomScale, y: -point.y * zoomScale)
+        settleZoom(animated: true)
+    }
+
+    /// Brings the zoom back within its limits — no smaller than fitting, no
+    /// bigger than `maximumZoom`, and no further aside than the media's own
+    /// edges — and sharpens a photo for the magnification it lands on.
+    private func settleZoom(animated: Bool) {
+        zoomScale = min(max(zoomScale, 1), Self.maximumZoom)
+        if zoomScale <= 1.01 {
+            zoomScale = 1
+            zoomOffset = .zero
+        } else {
+            zoomOffset = clampedZoomOffset(zoomOffset, scale: zoomScale)
+        }
+        let changes: () -> Void = { [weak self] in self?.applyZoom() }
+        if animated {
+            UIView.animate(withDuration: 0.3, delay: 0, usingSpringWithDamping: 1, initialSpringVelocity: 0,
+                           options: [.allowUserInteraction, .beginFromCurrentState], animations: changes)
+        } else {
+            changes()
+        }
+        if refreshPreviewSourceIfNeeded() { renderPreview() }
+    }
+
+    /// The offset nearest `offset` that keeps the zoomed media covering the
+    /// preview area, or centred along an axis where it's narrower than it.
+    private func clampedZoomOffset(_ offset: CGPoint, scale: CGFloat) -> CGPoint {
+        let bounds = imageView.bounds
+        let media = displayedImageFrame()
+        func clamp(_ value: CGFloat, low: CGFloat, high: CGFloat, half: CGFloat) -> CGFloat {
+            if high - low <= 2 * half { return -(low + high) / 2 }
+            return min(max(value, half - high), -half - low)
+        }
+        return CGPoint(
+            x: clamp(offset.x, low: (media.minX - bounds.midX) * scale, high: (media.maxX - bounds.midX) * scale,
+                     half: bounds.width / 2),
+            y: clamp(offset.y, low: (media.minY - bounds.midY) * scale, high: (media.maxY - bounds.midY) * scale,
+                     half: bounds.height / 2))
+    }
+
+    /// Back to fitting the preview area.
+    func resetZoom(animated: Bool = false) {
+        pinchAnchor = nil
+        guard zoomScale != 1 || zoomOffset != .zero else { return }
+        zoomScale = 1
+        zoomOffset = .zero
+        settleZoom(animated: animated)
+    }
+
+    // MARK: - Paging
+
+    /// A page turn between items, tab-view style: a track over the canvas
+    /// holding a still of the selected item flanked by its neighbours, which
+    /// follows the finger and settles on a page. The live canvas stays put
+    /// underneath and only switches once the turn lands.
+    private struct Paging {
+        /// Covers the live canvas — it stays put, so the canvas never shows
+        /// at an edge the moving pages have left.
+        let cover: UIView
+        /// The pages, side by side; this is what moves.
+        let track: UIView
+        /// The pages on the track, keyed by their offset from the selected item.
+        let pages: [Int: UUID]
+        let pageWidth: CGFloat
+        /// Whether the video was playing when the turn began, to resume it if
+        /// the turn springs back.
+        let resumesPlayback: Bool
+        /// The finger is still on it; once it lets go — or for a strip tap,
+        /// from the start — the track is animating and a new drag leaves it be.
+        var isTracking: Bool
+    }
+
+    /// Whether a page turn is under way — for tests.
+    var isPaging: Bool { paging != nil }
+
+    /// Whether a drag on the canvas may turn pages at all.
+    private var allowsPaging: Bool { !isSingleItemEditor && appearance.allowsSwipeBetweenItems }
+
+    /// A one-finger drag on empty canvas pans zoomed-in media, and otherwise
+    /// turns the page.
+    private func handleCanvasPan(_ pan: UIPanGestureRecognizer) {
+        if pan.state == .began { panMovesZoom = isZoomed }
+        if panMovesZoom {
+            handleZoomPan(pan)
+        } else {
+            handlePagingPan(pan)
+        }
+    }
+
+    @objc private func handlePagingPan(_ pan: UIPanGestureRecognizer) {
+        switch pan.state {
+        case .began:
+            beginPaging()
+        case .changed:
+            updatePaging(translation: pan.translation(in: view).x)
+        case .ended:
+            endPaging(velocity: pan.velocity(in: view).x)
+        case .cancelled, .failed:
+            endPaging(velocity: 0, cancelled: true)
+        default:
+            break
+        }
+    }
+
+    /// Lays the track over the canvas with the selected item's neighbours on
+    /// either side. Internal so tests can turn pages without a real touch.
+    func beginPaging() {
+        guard paging == nil else { return }
+        let index = selectedIndex
+        var pages: [Int: UUID] = [:]
+        for offset in [-1, 1] where items.indices.contains(index + offset) {
+            pages[offset] = items[index + offset].id
+        }
+        startPaging(pages: pages, tracking: true)
+    }
+
+    /// Moves the track with the finger; past the first or last item it gives
+    /// way only grudgingly.
+    func updatePaging(translation: CGFloat) {
+        guard let paging, paging.isTracking else { return }
+        let offset = translation < 0 ? 1 : -1
+        let x = paging.pages[offset] == nil ? translation * 0.3 : translation
+        paging.track.transform = CGAffineTransform(translationX: x, y: 0)
+    }
+
+    /// Settles the turn: on the neighbour when the drag — carried on by its
+    /// speed — passed halfway, otherwise back where it started.
+    func endPaging(velocity: CGFloat, cancelled: Bool = false) {
+        guard let paging, paging.isTracking else { return }
+        let x = paging.track.transform.tx
+        let projected = x + velocity * 0.2
+        var offset = 0
+        if !cancelled, abs(projected) > paging.pageWidth / 2 {
+            let candidate = projected < 0 ? 1 : -1
+            if paging.pages[candidate] != nil { offset = candidate }
+        }
+        settlePaging(on: offset, velocity: velocity)
+    }
+
+    /// Selects a strip tap's target straight away — the strip and
+    /// `onSelectionChange` follow at once — and slides it in over the canvas
+    /// from the side it sits on, whichever item it is.
+    private func turnPage(to id: UUID) {
+        guard id != selectedItemID, let target = items.firstIndex(where: { $0.id == id }) else { return }
+        let offset = target > selectedIndex ? 1 : -1
+        guard view.window != nil, startPaging(pages: [offset: id], tracking: false), let paging else {
+            select(id)
+            return
+        }
+        // The track is on its own from here: the selection it shows has
+        // already happened underneath.
+        self.paging = nil
+        select(id)
+        UIView.animate(withDuration: 0.35, delay: 0, usingSpringWithDamping: 1,
+                       initialSpringVelocity: 0, options: [.allowUserInteraction]) {
+            paging.track.transform = CGAffineTransform(translationX: -CGFloat(offset) * paging.pageWidth, y: 0)
+        } completion: { [weak self] _ in
+            self?.retire(paging.cover)
+        }
+    }
+
+    @discardableResult
+    private func startPaging(pages: [Int: UUID], tracking: Bool) -> Bool {
+        guard paging == nil, mode == .normal, items.count > 1, !imageView.bounds.isEmpty else { return false }
+        resetZoom()
+        overlayContainer.deselect()
+        let wasPlaying = isVideoPlaying
+        if wasPlaying {
+            player?.pause()
+            syncTransport(animated: false)
+        }
+
+        // An opaque cover hides the live canvas, which would otherwise show
+        // through wherever the pages have moved off; it sits below the
+        // chrome, which stays where it is. The pages move on a track over it.
+        let cover = UIView(frame: view.bounds)
+        cover.backgroundColor = view.backgroundColor
+        cover.isUserInteractionEnabled = false
+        let track = UIView(frame: cover.bounds)
+        cover.addSubview(track)
+        let pageWidth = view.bounds.width
+        let canvas = [imageView, passthroughHost, overlayContainer].filter { !$0.isHidden }
+        for live in canvas {
+            guard let still = live.snapshotView(afterScreenUpdates: false) else { continue }
+            still.frame = live.frame
+            track.addSubview(still)
+        }
+        for (offset, id) in pages {
+            let page = pageView(for: id)
+            page.frame = pageFrame(for: id).offsetBy(dx: CGFloat(offset) * pageWidth, dy: 0)
+            track.addSubview(page)
+        }
+        view.insertSubview(cover, aboveSubview: overlayContainer)
+        setVideoControlsFaded(true)
+        paging = Paging(cover: cover, track: track, pages: pages, pageWidth: pageWidth, resumesPlayback: wasPlaying,
+                        isTracking: tracking)
+        return true
+    }
+
+    /// Animates the track onto the page `offset` from the selected item — `0`
+    /// springs back — and selects that page's item once it lands.
+    private func settlePaging(on offset: Int, velocity: CGFloat) {
+        self.paging?.isTracking = false
+        guard let paging else { return }
+        let target = -CGFloat(offset) * paging.pageWidth
+        let distance = target - paging.track.transform.tx
+        let springVelocity = abs(distance) > 1 ? velocity / distance : 0
+        UIView.animate(withDuration: 0.35, delay: 0, usingSpringWithDamping: 1,
+                       initialSpringVelocity: springVelocity, options: [.allowUserInteraction]) {
+            paging.track.transform = CGAffineTransform(translationX: target, y: 0)
+        } completion: { [weak self] _ in
+            guard let self, self.paging?.cover === paging.cover else { return }
+            guard let id = paging.pages[offset] else {
+                self.abandonPaging()
+                if paging.resumesPlayback {
+                    self.player?.play()
+                    self.syncTransport(animated: false)
+                }
+                return
+            }
+            self.paging = nil
+            self.select(id)
+            self.retire(paging.cover)
+        }
+    }
+
+    /// Fades a landed turn off the canvas it now matches. It keeps covering
+    /// the new item for a moment while it loads — a video's first frame takes
+    /// one.
+    private func retire(_ cover: UIView) {
+        setVideoControlsFaded(false)
+        UIView.animate(withDuration: 0.2, delay: 0.05, options: [.allowUserInteraction]) {
+            cover.alpha = 0
+        } completion: { _ in
+            cover.removeFromSuperview()
+        }
+    }
+
+    /// Drops a page turn on the spot, leaving the canvas as it is.
+    private func abandonPaging() {
+        guard let paging else { return }
+        self.paging = nil
+        paging.track.layer.removeAllAnimations()
+        paging.cover.removeFromSuperview()
+        setVideoControlsFaded(false)
+    }
+
+    /// The transport, filmstrip and readout belong to the item on the canvas,
+    /// so they step out of a page turn and come back with whatever it lands on.
+    private func setVideoControlsFaded(_ faded: Bool) {
+        UIView.animate(withDuration: faded ? 0.15 : 0.2, delay: 0, options: [.allowUserInteraction, .beginFromCurrentState]) {
+            for control in [self.playPauseButton, self.trimScrubber, self.timeLabel] as [UIView] {
+                control.alpha = faded ? 0 : 1
+            }
+        }
+    }
+
+    /// Where item `id` sits when it's on the canvas, in the view: the preview
+    /// area, or for a video the box above its controls — the same box
+    /// `videoPreviewBounds` fits the player into, worked out even before any
+    /// video has put its controls on screen.
+    private func pageFrame(for id: UUID) -> CGRect {
+        let area = imageView.frame
+        guard let item = items.first(where: { $0.id == id }), case .video = item.source else { return area }
+        let controlsTop: CGFloat
+        if timeLabel.superview != nil, timeLabel.frame.height > 0 {
+            controlsTop = timeLabel.frame.minY
+        } else {
+            controlsTop = bottomChromeTopY - Self.timeLabelBottomGap - Self.timeLabelHeight
+                - (offersTrim ? Self.filmstripBottomGap + Self.filmstripHeight : 0)
+        }
+        let limit = controlsTop - Self.videoControlsGap
+        guard limit > area.minY, limit < area.maxY else { return area }
+        return CGRect(x: area.minX, y: area.minY, width: area.width, height: limit - area.minY)
+    }
+
+    /// Where `bottomChromeTopAnchor` is, in the view.
+    private var bottomChromeTopY: CGFloat {
+        if appearance.toolbarPlacement == .bottom, let toolRowContainer {
+            let row = toolRowContainer === toolRowBackground ? toolRow : toolRowContainer
+            return view.convert(row.bounds, from: row).minY
+        }
+        if let floatingDoneButton { return floatingDoneButton.frame.minY }
+        return bottomChromeGuide.layoutFrame.minY
+    }
+
+    /// What a page turn shows for item `id`: the host's own view for
+    /// passthrough content without a thumbnail — a document has nothing else
+    /// to show — and otherwise the best picture on hand.
+    private func pageView(for id: UUID) -> UIView {
+        if let item = items.first(where: { $0.id == id }),
+           case let .passthrough(thumbnail, preview) = item.source, thumbnail == nil {
+            return preview()
+        }
+        let page = UIImageView(image: pagePreview(for: id))
+        page.contentMode = .scaleAspectFit
+        return page
+    }
+
+    /// The best picture of item `id` on hand: its screen-sized render, or else
+    /// its strip thumbnail.
+    private func pagePreview(for id: UUID) -> UIImage? {
+        pagePreviews[id]?.image ?? thumbnailStrip.thumbnail(for: id)
+    }
+
+    /// Renders the selected item's neighbours at screen size, one at a time,
+    /// and forgets everyone else's.
+    private func prefetchPagePreviews() {
+        guard !isSingleItemEditor, isViewLoaded else { return }
+        let index = selectedIndex
+        let neighbours = [index - 1, index + 1].filter(items.indices.contains).map { items[$0] }
+        let wanted = Set(neighbours.map(\.id))
+        pagePreviews = pagePreviews.filter { wanted.contains($0.key) }
+        let stale = neighbours.filter { pagePreviews[$0.id]?.recipe != $0.recipe }
+        pagePreviewTask?.cancel()
+        guard !stale.isEmpty else { pagePreviewTask = nil; return }
+        let size = imageView.bounds.isEmpty ? view.bounds.size : imageView.bounds.size
+        let maxPixelSize = max(size.width, size.height) * max(1, traitCollection.displayScale)
+        let renderer = editRenderer
+        let jobs = stale.map { item in
+            (item, overlayImages.merging(renderer.stickerImages(for: item.recipe)) { cached, _ in cached })
+        }
+        pagePreviewTask = Task { @MainActor [weak self] in
+            for (item, images) in jobs {
+                let image = await renderer.thumbnail(for: item, maxPixelSize: maxPixelSize, images: images)
+                guard let self, !Task.isCancelled else { return }
+                if let image { pagePreviews[item.id] = (item.recipe, image) }
+            }
+        }
     }
 
     /// Stops everything the editor runs in the background: pauses playback,
@@ -2730,6 +3191,9 @@ public final class MediaEditorViewController: UIViewController {
         thumbnailTask?.cancel()
         thumbnailTask = nil
         thumbnailDebounce?.cancel()
+        pagePreviewTask?.cancel()
+        pagePreviewTask = nil
+        abandonPaging()
         photoLoadTask?.cancel()
         videoLoadTask?.cancel()
         teardownVideo()
@@ -2882,7 +3346,7 @@ public final class MediaEditorViewController: UIViewController {
 
 extension MediaEditorViewController: ThumbnailStripDelegate {
     func thumbnailStrip(_ strip: ThumbnailStripView, didSelect id: UUID) {
-        select(id)
+        turnPage(to: id)
     }
 
     func thumbnailStrip(_ strip: ThumbnailStripView, didRemove id: UUID) {
