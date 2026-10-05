@@ -45,3 +45,4 @@ model.
 ### Essentials
 
 - ``MediaEditorView``
+- ``MediaEditorProxy``

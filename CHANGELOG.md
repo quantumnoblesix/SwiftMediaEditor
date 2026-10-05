@@ -6,55 +6,69 @@ All notable changes to this package are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-05
+
 ### Added
 
-- `EditorAppearance.toolbarPlacement` (`.top` / `.bottom`) and
-  `toolbarStyle` (`.floatingBar` / `.circularButtons`), plus the
-  `EditorAppearance.messaging` preset: an ✕ and circular tool buttons across
-  the top, like a chat app's pre-send editor. Under the circular style undo
-  and redo get matching circles too.
-- A host-supplied bottom accessory — `bottomAccessory:` on
-  `MediaEditorViewController`, and a `bottomAccessory` view builder with a
-  `MediaEditorProxy` on `MediaEditorView` — for a caption field and send
-  button. Like a toolbar, it runs to the bottom edge with its content kept
-  above the home indicator; it rides up with the keyboard, hides while a tool
-  is open, and replaces the editor's own Done button. The sticker delete bin
-  stays clear of it and of a tool row stacked on it.
+#### Chat-style layout and a host bottom bar
 
-- `DrawingData.zIndex`, `Overlay.sitsAboveDrawing(at:)`,
-  `EditRecipe.overlayLayers` and `EditRecipe.nextZIndex`: the drawing now
-  stacks among the stickers. New strokes go over the picture stickers already
-  placed, a sticker added afterwards goes over the strokes, and text always
-  stays on top. Preview, photo export and video export all follow it. Recipes
-  saved earlier decode with the drawing under every sticker, as they rendered.
+- `EditorAppearance.toolbarPlacement` puts the tool row at the top or the
+  bottom (`EditorToolbarPlacement`), and `toolbarStyle` draws it as one glass
+  bar or as a circular button per tool (`EditorToolbarStyle`). With circular
+  buttons, Cancel becomes an ✕ and undo/redo get matching circles;
+  `circularButtonDiameter` sizes them.
+- `EditorAppearance.messaging`: the layout of a chat app's pre-send editor —
+  an ✕ and circular tools across the top, leaving the bottom free for a
+  caption bar.
+- A host-supplied bottom bar — `bottomAccessory:` on `MediaEditorViewController`,
+  and a `bottomAccessory` view builder on `MediaEditorView` that receives a
+  `MediaEditorProxy` to drive the editor. Typically a caption field and a send
+  button. It runs to the bottom edge with its content kept above the home
+  indicator, rides up with the keyboard, and hides while a tool is open.
+  With one installed, the editor shows no Done button of its own
+  (`showsDoneButton`): the bar's send action calls `finish()`.
+
+#### Editing model
+
+- The drawing has a stacking position among the stickers
+  (`DrawingData.zIndex`, `Overlay.sitsAboveDrawing(at:)`,
+  `EditRecipe.overlayLayers`, `EditRecipe.nextZIndex`). New strokes go over the
+  picture stickers already placed, a sticker added afterwards goes over the
+  strokes, and text always stays on top. The preview, photo export and video
+  export all follow it. Recipes saved with 1.0 load and render as before.
+- `MediaGeometry` and `EditRecipe.carryingOverlays(from:sourceSize:)` map edits
+  between a recipe's cropped, rotated output and the original media, so they
+  can follow the media through a geometry change.
+- `NormalizedRect.isClose(to:tolerance:)`.
 
 ### Changed
 
-- The pencil draws in place among the stickers — over picture stickers, under
-  text — with every other edit still in view.
+- The editor is always dark, whatever the system appearance — including what
+  it presents (text editor, photo and colour pickers, alerts), the PencilKit
+  tool palette, and the host's toolbar and bottom bar. Pencil ink keeps its
+  true colours on the canvas, in the palette's swatches and in the result,
+  instead of PencilKit's dark-mode adaptation.
 - Stickers and the drawing stay on the part of the media they were placed on
-  when it's cropped, rotated or flipped, instead of moving with the frame.
-  Anything a crop cuts away is kept, hidden, and returns if the crop is widened
-  (`MediaGeometry`, `EditRecipe.carryingOverlays(from:sourceSize:)`).
+  when it's cropped, rotated or flipped, instead of moving with the frame. A
+  flip mirrors where a sticker sits without mirroring its text. Anything a crop
+  cuts away is kept, hidden, and comes back if the crop is widened.
 - The crop tool shows the stickers and drawing on the whole media, dimmed where
   the crop leaves them out. They fade out while the crop is being adjusted and
-  come back once the change is done. Filters stay visible while cropping.
+  return once the change is done. Filters stay visible while cropping.
+- The pencil draws in place among the stickers — over picture stickers, under
+  text — with every other edit still in view.
 - Undo and redo appear once there is something to undo, and hide while a tool
   is open.
-- `EditRecipe.rendersDifferently(from:)` no longer counts the drawing, which
-  is now a live layer over the render rather than part of it.
-- `MediaEditorView` is generic over its bottom accessory. Call sites compile
-  unchanged; code that names the type explicitly should use
-  `MediaEditorView<EmptyView>`.
-- Pencil ink keeps its true colours in the always-dark editor — on the canvas,
-  in the tool palette's swatches and in the result — instead of PencilKit's
-  dark-mode adaptation, which showed black ink as white while drawing.
-- Liquid Glass bars no longer come back light for a moment after closing a
-  tool.
-- The editor is always dark, whatever the system appearance — including what
-  it presents (text editor, photo and color pickers, alerts), the PencilKit
-  tool palette, and the host's
-  toolbar and bottom accessory.
+- `EditRecipe.rendersDifferently(from:)` no longer counts the drawing, which is
+  now a live layer over the preview rather than baked into it — so adding
+  strokes, or undoing them, no longer re-renders the photo.
+- Saving a photo with edits composites everything in one full-resolution pass,
+  using less peak memory than before.
+
+### Fixed
+
+- Opening the crop tool and applying without a change no longer records an
+  undo step, and four quarter turns no longer leave a 360° rotation.
 
 ## [1.0.0] - 2026-09-12
 
@@ -146,5 +160,6 @@ The first public release.
 - On native macOS only `MediaEditorCore` is available; the editor UI runs on the
   Mac through Mac Catalyst.
 
-[Unreleased]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.0.0...HEAD
+[Unreleased]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.1.0...HEAD
+[1.1.0]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.0.0...1.1.0
 [1.0.0]: https://github.com/quantumnoblesix/SwiftMediaEditor/releases/tag/1.0.0

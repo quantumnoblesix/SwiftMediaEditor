@@ -3,7 +3,7 @@
 A native, dependency-free media editor for iOS — edit **photos** and **videos**
 with the same non-destructive engine, usable from both **UIKit** and **SwiftUI**.
 
-> Current release: **1.0.0**. See the [changelog](CHANGELOG.md) for what's included.
+> Current release: **1.1.0**. See the [changelog](CHANGELOG.md) for what's included.
 
 ## Features
 
@@ -20,8 +20,10 @@ with the same non-destructive engine, usable from both **UIKit** and **SwiftUI**
 | PencilKit drawing | ✅ | ✅ |
 | Overlays: text, emoji, images | ✅ | ✅ |
 | Drag a sticker onto the bin to delete it | ✅ | ✅ |
+| Edits stay on the media through crop, rotate and flip | ✅ | ✅ |
 | Undo / redo | ✅ | ✅ |
 | Re-editing from a saved recipe | ✅ | ✅ |
+| Chat-style layout with your own caption / send bar | ✅ | ✅ |
 
 Built entirely on Apple frameworks — Core Image, Core Graphics, PencilKit, and
 AVFoundation. No third-party dependencies.
@@ -73,15 +75,19 @@ Keys are listed in `L10n.allKeys`.
 The chrome adopts **iOS 26 Liquid Glass** by default: floating bars render with
 `UIGlassEffect` and bar actions use the glass / prominent-glass button
 configurations, falling back to a dark blur material with plain tinted titles on
-iOS 17–25.
+iOS 17–25. The editor is **always dark**, whatever the system appearance —
+media reads best on black — and so is everything it presents and anything the
+host puts in it. Pencil ink still keeps its true colours.
 
-The chrome is laid out as three groups: **Cancel** and an **undo/redo** pill at
-the top left, **Done** at the top right, and a single centred row of *tools* at
-the bottom that hugs its content. Keeping history out of the tool row is what
+By default the chrome is laid out as three groups: **Cancel** and an
+**undo/redo** pill at the top left, **Done** at the top right, and a single
+centred row of *tools* at the bottom that hugs its content. Undo and redo appear
+once there's something to undo. Keeping history out of the tool row is what
 lets that row stay one uncrowded line — three or four glyphs, not six.
 
-Customization comes in two tiers — restyle what the package draws, or replace
-the tool row outright.
+Customization comes in three tiers — restyle what the package draws, move it
+into a chat-style layout with your own bottom bar, or replace the tool row
+outright.
 
 ### Restyling — `EditorAppearance`
 
@@ -96,12 +102,43 @@ appearance.symbols[.crop] = "crop"       // swap any action's SF Symbol
 appearance.destructive = .systemPink     // the sticker delete bin
 appearance.trimColor = .systemGreen      // the video trimmer (nil follows accent)
 appearance.prefersLiquidGlass = false    // one look across all OS versions
+appearance.toolbarPlacement = .top       // tools in the top bar, or .bottom
+appearance.toolbarStyle = .circularButtons   // a circle per tool, or .floatingBar
 appearance.styleToolButton = { button, action in
     button.layer.cornerRadius = 8        // applied after the built-in styling
 }
 
 MediaEditorView(item: .video(url), appearance: appearance) { _ in }
 ```
+
+### Chat-style editor — `.messaging` and a bottom accessory
+
+The layout of a chat app's pre-send screen: an ✕ and circular tools across the
+top, and your own bar at the bottom — typically a caption field and a send
+button. The bar spans the full width, runs under the home indicator (its content
+is kept above it), rides up with the keyboard, and hides while a tool is open.
+With a bar installed the editor shows no Done button: your send action finishes
+the edit.
+
+```swift
+// SwiftUI — the builder receives a proxy to drive the editor.
+MediaEditorView(item: .photo(image), appearance: .messaging) { result in
+    send(result, caption: caption)
+} bottomAccessory: { editor in
+    CaptionBar(text: $caption) { editor.finish() }
+}
+```
+
+```swift
+// UIKit — pass any view; lay its content out against its safeAreaLayoutGuide.
+let editor = MediaEditorViewController(item: .photo(image), appearance: .messaging,
+                                       bottomAccessory: captionBar)
+captionBar.onSend = { [weak editor] in editor?.finish() }
+```
+
+`toolbarPlacement` and the accessory are independent: with `.bottom`, the tool
+row sits directly on top of the bar. The example app's **Chat Editor** screen
+shows the full setup — see `ChatEditorView.swift`.
 
 ### Replacing the toolbar — `MediaEditorToolbarProviding`
 
@@ -163,7 +200,7 @@ see `BrandedToolbar.swift`.
 Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/quantumnoblesix/SwiftMediaEditor.git", from: "1.0.0")
+.package(url: "https://github.com/quantumnoblesix/SwiftMediaEditor.git", from: "1.1.0")
 ```
 
 then add the product to your target — SwiftPM names the package after the
@@ -237,9 +274,13 @@ The editor is built to stay cheap on older hardware:
   through Core Image each time to fill a ~2 MP view. Full resolution is used
   only for the final render on save, where it matters. Crop and drawing
   geometry are stored normalized, so nothing about the output changes.
-- **Overlay edits skip the re-render.** Stickers composite as live views over
-  the preview, so dragging one needs no new bitmap
-  (`EditRecipe.rendersDifferently(from:)`).
+- **Overlay and drawing edits skip the re-render.** Stickers and strokes are
+  live layers over the preview, so moving a sticker or adding a stroke needs no
+  new photo render (`EditRecipe.rendersDifferently(from:)`), and the strokes are
+  rasterized at their on-screen size.
+- **Saving composites in one pass.** The photo, stickers and strokes are drawn
+  into a single full-resolution bitmap, keeping peak memory down on large
+  photos.
 - **The playback tick idles.** The video display link is paused while nothing is
   playing and runs at ~15 Hz otherwise, rather than tracking a ProMotion 120 Hz.
 - **Recipes compare by identity.** `ImageRef` is equal by `id`, so undo/redo
@@ -274,7 +315,14 @@ package still builds, tests, and ships — you just get the headless half.
 The design principle is **non-destructive editing**: user interaction produces a
 `Codable` `EditRecipe`, and rendering is `originalMedia + recipe → output`. This
 makes undo/redo, persistence, and re-editing trivial and keeps the photo and
-video pipelines symmetric. The DocC articles go deeper — see
+video pipelines symmetric.
+
+Stickers and strokes are laid out over the recipe's output frame. When a crop,
+rotation or flip changes that frame, `MediaGeometry` carries them along so they
+stay on the same part of the media; anything cropped away is kept and returns if
+the crop widens. The strokes stack among the stickers by `zIndex`: over the
+picture stickers already placed when they're drawn, under anything added later,
+and always under text. The DocC articles go deeper — see
 [Documentation](#documentation).
 
 ## Documentation
@@ -313,7 +361,8 @@ flow:
 
 1. **Media selection** — pick a source (sample image/video, library, or camera).
 2. **Editor choice** — the turnkey **Standard** editor, a **Branded** editor
-   showing the appearance and custom-toolbar APIs, or a **Custom** editor
+   showing the appearance and custom-toolbar APIs, a **Chat** editor with tools
+   across the top and a caption / send bar, or a **Custom** editor
    built entirely on the package's headless API (`PhotoRenderer` + `EditRecipe`
    plus Core Image filters). Choosing Custom first shows a **checklist** to pick
    which tools the editor should offer.
@@ -354,6 +403,9 @@ swift test
    video compositor
 8. ✅ Release 1.0.0 — Apache-2.0 license, macOS support, theming and a
    custom-toolbar API, DocC documentation, privacy manifests
+9. ✅ Release 1.1.0 — chat-style layout with a host bottom bar, always-dark
+   chrome, edits anchored to the media through crop and rotation, drawing
+   layered among the stickers
 
 Photos and videos are feature-complete. Video supports the crop tool (aspect
 presets, straighten dial, rotate/flip), drawing, text and stickers, timeline

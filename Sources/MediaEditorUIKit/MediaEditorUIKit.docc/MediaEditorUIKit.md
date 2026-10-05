@@ -29,6 +29,8 @@ use the same editor through `MediaEditorView`, and the model it edits lives in
 
 - <doc:CustomizingTheEditor>
 - ``EditorAppearance``
+- ``EditorToolbarPlacement``
+- ``EditorToolbarStyle``
 - ``MediaEditorToolbarProviding``
 - ``EditorAction``
 - ``EditorBarButtonRole``
