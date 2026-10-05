@@ -14,6 +14,26 @@
 
 import UIKit
 
+/// Where the editor's tool row sits.
+public enum EditorToolbarPlacement: Hashable, Sendable {
+    /// In the top bar, trailing the close button — the layout chat apps use for
+    /// their pre-send editor. The Done button, when the editor shows one, moves
+    /// to the bottom trailing corner.
+    case top
+    /// Floating at the bottom, just above the bottom accessory when there is one.
+    case bottom
+}
+
+/// How the tool row's buttons are drawn.
+public enum EditorToolbarStyle: Hashable, Sendable {
+    /// Plain glyphs sharing one floating bar.
+    case floatingBar
+    /// Each glyph on its own circular backing, with an ✕ glyph for Cancel and
+    /// undo/redo in circles of their own — the look of a chat app's media
+    /// editor.
+    case circularButtons
+}
+
 /// How the editor's chrome looks.
 ///
 /// Hand one to `MediaEditorViewController` to restyle the built-in bars and
@@ -56,11 +76,20 @@ public struct EditorAppearance {
     /// Point size of the tool-row glyphs.
     public var toolSymbolPointSize: CGFloat = 19
     /// Point size of the undo/redo glyphs, which sit on their own smaller pill
-    /// under the top bar rather than in the tool row.
+    /// under the top bar rather than in the tool row. Under
+    /// ``EditorToolbarStyle/circularButtons`` they get a circle each, sized like
+    /// the tool row's, and use ``toolSymbolPointSize`` instead.
     public var historySymbolPointSize: CGFloat = 15
     /// Opt out of Liquid Glass and use the blur material on every OS. Useful
     /// when a host wants one consistent look across iOS versions.
     public var prefersLiquidGlass: Bool = true
+    /// Where the tool row sits. A host-supplied row from
+    /// ``MediaEditorToolbarProviding`` follows this too.
+    public var toolbarPlacement: EditorToolbarPlacement = .bottom
+    /// How the built-in tool row draws its buttons.
+    public var toolbarStyle: EditorToolbarStyle = .floatingBar
+    /// Diameter of each button under ``EditorToolbarStyle/circularButtons``.
+    public var circularButtonDiameter: CGFloat = 44
 
     /// Per-action glyph overrides. Anything absent falls back to
     /// ``EditorAction/defaultSymbolName``.
@@ -78,6 +107,17 @@ public struct EditorAppearance {
 
     /// The stock appearance.
     public static var `default`: EditorAppearance { EditorAppearance() }
+
+    /// The layout of a chat app's pre-send editor: an ✕ and a row of circular
+    /// tool buttons across the top, leaving the bottom free for a caption bar
+    /// passed as the editor's `bottomAccessory`.
+    public static var messaging: EditorAppearance {
+        var appearance = EditorAppearance()
+        appearance.toolbarPlacement = .top
+        appearance.toolbarStyle = .circularButtons
+        appearance.toolSymbolPointSize = 18
+        return appearance
+    }
 
     /// Whether Liquid Glass will actually be used: the OS provides it *and*
     /// the host hasn't opted out.
@@ -100,6 +140,10 @@ public struct EditorAppearance {
             let glass = UIGlassEffect(style: .regular)
             glass.isInteractive = true                    // fluid, touch-reactive glass
             let view = UIVisualEffectView(effect: glass)
+            // The editor is always dark, and glass has to be told directly: the
+            // style it inherits isn't applied when a bar is shown again after a
+            // tool, so it comes back light and only darkens a moment later.
+            view.overrideUserInterfaceStyle = .dark
             // Let the glass supply its own continuous-rounded shape rather than
             // clipping to a plain corner radius (keeps the fluid edges).
             view.cornerConfiguration = .corners(radius: .fixed(cornerRadius))
@@ -129,6 +173,7 @@ public struct EditorAppearance {
                 config.baseForegroundColor = colour
             }
             button.configuration = config
+            button.overrideUserInterfaceStyle = .dark   // see `makeBarBackground`
         } else {
             button.setTitle(title, for: .normal)
             button.setTitleColor(colour, for: .normal)
@@ -153,6 +198,28 @@ public struct EditorAppearance {
         button.tintColor = tint
         button.accessibilityLabel = action.localizedTitle
         styleToolButton?(button, action)
+    }
+
+    /// Seats `button` on a circular backing — Liquid Glass where available, the
+    /// dark blur otherwise — for ``EditorToolbarStyle/circularButtons``.
+    ///
+    /// Returns the backing, which is what goes into the layout; the button fills
+    /// it. Hide the backing, not the button, to take it out of a row.
+    public func makeCircularBacking(for button: UIButton) -> UIView {
+        let diameter = circularButtonDiameter
+        let backing = makeBarBackground(cornerRadius: diameter / 2)
+        backing.translatesAutoresizingMaskIntoConstraints = false
+        button.translatesAutoresizingMaskIntoConstraints = false
+        backing.contentView.addSubview(button)
+        NSLayoutConstraint.activate([
+            backing.widthAnchor.constraint(equalToConstant: diameter),
+            backing.heightAnchor.constraint(equalToConstant: diameter),
+            button.leadingAnchor.constraint(equalTo: backing.contentView.leadingAnchor),
+            button.trailingAnchor.constraint(equalTo: backing.contentView.trailingAnchor),
+            button.topAnchor.constraint(equalTo: backing.contentView.topAnchor),
+            button.bottomAnchor.constraint(equalTo: backing.contentView.bottomAnchor),
+        ])
+        return backing
     }
 
     /// Styles a symbol button that isn't tied to an action (the crop tool's

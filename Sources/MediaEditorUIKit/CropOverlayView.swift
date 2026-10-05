@@ -24,6 +24,11 @@ final class CropOverlayView: UIView {
 
     /// The rect, in this view's coordinates, where the image is displayed
     /// (aspect-fit). The crop is constrained to this frame.
+    /// Called when the user grabs the frame to move or resize it…
+    var onAdjustmentBegan: (() -> Void)?
+    /// …and when they let go.
+    var onAdjustmentEnded: (() -> Void)?
+
     var imageFrame: CGRect = .zero {
         didSet {
             if cropRect == .zero { cropRect = clampRect }
@@ -157,6 +162,7 @@ final class CropOverlayView: UIView {
             grab = hitTestGrab(at: point)
             grabStartCrop = cropRect
             grabStartPoint = point
+            if grab != .none { onAdjustmentBegan?() }
         case .changed:
             guard grab != .none else { return }
             if grab == .move {
@@ -171,6 +177,7 @@ final class CropOverlayView: UIView {
                 resize(corner: grab, to: point)
             }
         case .ended, .cancelled, .failed:
+            if grab != .none { onAdjustmentEnded?() }
             grab = .none
         default:
             break

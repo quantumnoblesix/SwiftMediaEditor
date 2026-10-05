@@ -16,6 +16,7 @@ enum Route: Hashable {
     case editorChoice
     case standardEditor
     case brandedEditor
+    case chatEditor
     case customOptions
     case customEditor
     case result
@@ -67,6 +68,7 @@ final class AppCoordinator: ObservableObject {
         switch kind {
         case .standard: path.append(.standardEditor)
         case .branded:  path.append(.brandedEditor)
+        case .chat:     path.append(.chatEditor)
         case .custom:   path.append(.customOptions)
         }
     }

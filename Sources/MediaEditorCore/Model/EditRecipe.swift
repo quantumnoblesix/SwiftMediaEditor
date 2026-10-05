@@ -84,17 +84,16 @@ public struct EditRecipe: Codable, Equatable, Sendable {
 
     /// Whether the *rendered base image* differs between the two recipes.
     ///
-    /// Overlays are excluded on purpose: they're composited as live views on top
-    /// of the render, so moving a sticker changes nothing underneath. Callers
-    /// use this to skip a re-render — which for a large photo is tens of
-    /// milliseconds and tens of megabytes — on an overlay-only edit. It also
-    /// avoids touching overlay image payloads at all.
+    /// Overlays and the drawing are excluded on purpose: they're composited as
+    /// live layers on top of the render, so moving a sticker or adding a stroke
+    /// changes nothing underneath. Callers use this to skip a re-render — which
+    /// for a large photo is tens of milliseconds and tens of megabytes — on such
+    /// an edit. It also avoids comparing overlay and stroke payloads at all.
     public func rendersDifferently(from other: EditRecipe) -> Bool {
         crop != other.crop
             || rotation != other.rotation
             || flip != other.flip
             || filter != other.filter
-            || drawing != other.drawing
     }
 
     /// Overlays sorted bottom-to-top for compositing.

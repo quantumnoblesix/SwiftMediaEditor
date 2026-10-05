@@ -120,6 +120,35 @@ public struct Overlay: Codable, Equatable, Identifiable, Sendable {
         self.transform = transform
         self.zIndex = zIndex
     }
+
+    /// Whether this overlay sits above a drawing stacked at `drawingZIndex`.
+    ///
+    /// Text and emoji always do, so captions stay readable over the strokes.
+    /// A picture sticker does when it was placed after the drawing was last
+    /// applied — a higher `zIndex` — so the pencil marks up the stickers already
+    /// on the media, while a sticker added later lands on top of the strokes.
+    public func sitsAboveDrawing(at drawingZIndex: Int) -> Bool {
+        if case .text = content { return true }
+        return zIndex > drawingZIndex
+    }
+}
+
+public extension EditRecipe {
+    /// The overlays split around the drawing, each half in stacking order.
+    /// Every renderer draws `belowDrawing`, then the strokes, then
+    /// `aboveDrawing`, so the preview and the export agree.
+    var overlayLayers: (belowDrawing: [Overlay], aboveDrawing: [Overlay]) {
+        let sorted = overlays.sorted { $0.zIndex < $1.zIndex }
+        guard let drawing else { return ([], sorted) }
+        return (sorted.filter { !$0.sitsAboveDrawing(at: drawing.zIndex) },
+                sorted.filter { $0.sitsAboveDrawing(at: drawing.zIndex) })
+    }
+
+    /// The `zIndex` for something placed now: above every overlay and the
+    /// drawing.
+    var nextZIndex: Int {
+        max(overlays.map(\.zIndex).max() ?? -1, drawing?.zIndex ?? -1) + 1
+    }
 }
 
 /// Freehand drawing produced by PencilKit. Stored as the opaque
@@ -133,10 +162,40 @@ public struct DrawingData: Codable, Equatable, Sendable {
     public var data: Data
     public var canvasWidth: Double
     public var canvasHeight: Double
+    /// Where the strokes stack among the overlays — see
+    /// `Overlay.sitsAboveDrawing(at:)`. The editor sets it above every overlay
+    /// each time the strokes change. The default, `Int.min`, keeps the drawing
+    /// under every picture sticker, which is how recipes saved before this
+    /// property existed render.
+    public var zIndex: Int
 
-    public init(data: Data, canvasWidth: Double, canvasHeight: Double) {
+    public init(data: Data, canvasWidth: Double, canvasHeight: Double, zIndex: Int = .min) {
         self.data = data
         self.canvasWidth = canvasWidth
         self.canvasHeight = canvasHeight
+        self.zIndex = zIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case data, canvasWidth, canvasHeight, zIndex
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        data = try c.decode(Data.self, forKey: .data)
+        canvasWidth = try c.decode(Double.self, forKey: .canvasWidth)
+        canvasHeight = try c.decode(Double.self, forKey: .canvasHeight)
+        zIndex = try c.decodeIfPresent(Int.self, forKey: .zIndex) ?? .min
+    }
+
+    /// Leaves `zIndex` out while it's the legacy default, so recipes without a
+    /// stacking position encode exactly as they did — and never carry `Int.min`
+    /// into JSON consumers that read numbers as doubles.
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(data, forKey: .data)
+        try c.encode(canvasWidth, forKey: .canvasWidth)
+        try c.encode(canvasHeight, forKey: .canvasHeight)
+        if zIndex != .min { try c.encode(zIndex, forKey: .zIndex) }
     }
 }

@@ -35,7 +35,8 @@ protocol OverlayContainerDelegate: AnyObject {
 /// committed changes back for undo history.
 ///
 /// While a sticker is being moved it also shows a delete bin — wherever the host
-/// asks via `preferredTrashCenter`, else at the bottom of the media — and
+/// asks via `preferredTrashCenter` or `trashCenterProvider`, else at the bottom
+/// of the media — and
 /// releasing the sticker on the bin removes it.
 @MainActor
 final class OverlayContainerView: UIView {
@@ -44,11 +45,64 @@ final class OverlayContainerView: UIView {
 
     /// The rect (in this view's coordinates) where the image is displayed.
     var imageFrame: CGRect = .zero {
-        didSet { stickers.forEach { $0.applyLayout(canvasFrame: imageFrame) } }
+        didSet {
+            guard imageFrame != oldValue else { return }
+            // The layer's bounds start where its frame does, so everything in it
+            // keeps using this view's coordinates.
+            canvasLayer.frame = imageFrame
+            canvasLayer.bounds.origin = imageFrame.origin
+            stickers.forEach { $0.applyLayout(canvasFrame: imageFrame) }
+            drawingView.frame = imageFrame
+            drawingCanvas?.frame = imageFrame
+        }
+    }
+
+    /// Holds the stickers and the drawing over `imageFrame`, and clips them to
+    /// it: a sticker the crop has cut away stays in the recipe — widen the crop
+    /// and it's back — but shouldn't float over the letterboxing. A plain
+    /// rectangular clip rather than a mask, which would cost an offscreen pass
+    /// every frame over a playing video.
+    ///
+    /// Touches outside `imageFrame` never reach a sticker, but still land on
+    /// this view, so taps and pinches in the letterboxing keep working.
+    private let canvasLayer = UIView()
+
+    /// Whether to clip to `imageFrame`. Relaxed while a sticker is dragged, so
+    /// it stays in view on its way to the delete bin.
+    var clipsToCanvas = true {
+        didSet { updateCanvasClip() }
+    }
+
+    /// Whether the stickers are clipped to the media right now.
+    var isClippingToCanvas: Bool { canvasLayer.clipsToBounds }
+
+    /// The stickers and the drawing, bottom to top — for tests.
+    var layeredViews: [UIView] { canvasLayer.subviews }
+
+    private func updateCanvasClip() {
+        canvasLayer.clipsToBounds = clipsToCanvas && draggedSticker == nil
     }
 
     private var stickers: [StickerView] = []
     private(set) weak var selected: StickerView?
+
+    /// The recipe's strokes, stretched over `imageFrame` and stacked at
+    /// `drawingZIndex` among the stickers (see `Overlay.sitsAboveDrawing(at:)`).
+    let drawingView: UIImageView = {
+        let view = UIImageView()
+        view.contentMode = .scaleToFill
+        view.isUserInteractionEnabled = false
+        return view
+    }()
+    /// The live canvas while the pencil tool is open. It takes the drawing's
+    /// place in the stack, so strokes go down over the picture stickers and
+    /// under the text.
+    private(set) weak var drawingCanvas: UIView?
+    /// Where the drawing stacks among the stickers — the recipe's
+    /// `DrawingData.zIndex`.
+    var drawingZIndex: Int = .min {
+        didSet { if drawingZIndex != oldValue { arrangeLayers() } }
+    }
 
     /// Styles the delete bin. Set by the editor before the first drag.
     var appearance: EditorAppearance?
@@ -57,6 +111,11 @@ final class OverlayContainerView: UIView {
     /// aren't clamped to the canvas, and the editor doesn't clip this view.
     /// `nil` falls back to the bottom-centre of the displayed media.
     var preferredTrashCenter: CGPoint?
+    /// Asked for the bin's place whenever it's needed, for a host whose chrome
+    /// moves after layout — a bar the keyboard lifts, or one whose height only
+    /// settles later. Consulted when `preferredTrashCenter` is `nil`; returning
+    /// `nil` falls back to the bottom-centre of the media.
+    var trashCenterProvider: (() -> CGPoint?)?
     /// The drop target shown while a sticker is moving; built on first use.
     private var trashView: StickerTrashView?
     /// The sticker currently being moved, if any.
@@ -68,6 +127,9 @@ final class OverlayContainerView: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
+        canvasLayer.clipsToBounds = true
+        addSubview(canvasLayer)
+        canvasLayer.addSubview(drawingView)
         let tap = UITapGestureRecognizer(target: self, action: #selector(backgroundTapped))
         tap.cancelsTouchesInView = false
         addGestureRecognizer(tap)
@@ -89,7 +151,7 @@ final class OverlayContainerView: UIView {
     // (except the background tap above, which deselects).
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let hit = super.hitTest(point, with: event)
-        return hit === self ? self : hit
+        return hit === canvasLayer ? self : hit
     }
 
     // MARK: - Building
@@ -106,13 +168,62 @@ final class OverlayContainerView: UIView {
             }()
             let sticker = StickerView(overlay: overlay, image: image)
             sticker.delegate = self
-            addSubview(sticker)
+            canvasLayer.addSubview(sticker)
             sticker.applyLayout(canvasFrame: imageFrame)
             return sticker
         }
         if let id = previouslySelected {
             select(stickers.first { $0.overlay.id == id })
         }
+        arrangeLayers()
+    }
+
+    /// Restacks the subviews: the stickers under the drawing, the drawing (or
+    /// the live canvas), the stickers over it, then the delete bin. Within each
+    /// side the selected sticker comes last, so the one being moved stays on top
+    /// of its neighbours without crossing the strokes.
+    ///
+    /// While the pencil is open the canvas goes over every picture sticker —
+    /// the new strokes will, once applied.
+    private func arrangeLayers() {
+        func ordered(_ group: [StickerView]) -> [StickerView] {
+            group.filter { $0 !== selected } + group.filter { $0 === selected }
+        }
+        let z = drawingCanvas == nil ? drawingZIndex : .max
+        let below = stickers.filter { !$0.overlay.sitsAboveDrawing(at: z) }
+        let above = stickers.filter { $0.overlay.sitsAboveDrawing(at: z) }
+        let drawingLayer: UIView = drawingCanvas ?? drawingView
+        for view in ordered(below) + [drawingLayer] + ordered(above) {
+            canvasLayer.bringSubviewToFront(view)
+        }
+        if let trashView { bringSubviewToFront(trashView) }
+    }
+
+    // MARK: - Drawing
+
+    /// Seats `canvas` over the picture stickers and under the text for the
+    /// pencil tool. Stickers stay
+    /// visible but stop taking touches — the text ones sit above the canvas and
+    /// would otherwise swallow strokes that start on them.
+    func beginDrawing(with canvas: UIView) {
+        deselect()
+        drawingCanvas = canvas
+        canvas.frame = imageFrame
+        canvasLayer.addSubview(canvas)
+        drawingView.isHidden = true            // the canvas shows the strokes itself
+        stickers.forEach { $0.isUserInteractionEnabled = false }
+        gestureRecognizers?.forEach { $0.isEnabled = false }
+        arrangeLayers()
+    }
+
+    /// Takes the canvas out and hands the stickers their touches back.
+    func endDrawing() {
+        drawingCanvas?.removeFromSuperview()
+        drawingCanvas = nil
+        drawingView.isHidden = false
+        stickers.forEach { $0.isUserInteractionEnabled = true }
+        gestureRecognizers?.forEach { $0.isEnabled = true }
+        arrangeLayers()
     }
 
     /// The current overlays, reflecting any live gesture edits.
@@ -125,7 +236,7 @@ final class OverlayContainerView: UIView {
         selected?.isSelected = false
         selected = sticker
         sticker?.isSelected = true
-        if let sticker { bringSubviewToFront(sticker) }
+        arrangeLayers()
     }
 
     func deselect() { select(nil) }
@@ -146,6 +257,7 @@ final class OverlayContainerView: UIView {
     /// dragged over.
     var trashCenter: CGPoint {
         if let preferredTrashCenter { return preferredTrashCenter }
+        if let provided = trashCenterProvider?() { return provided }
         let area = imageFrame.isEmpty ? bounds : imageFrame
         let radius = StickerTrashView.diameter / 2
         return CGPoint(x: area.midX, y: max(area.minY + radius, area.maxY - radius - 16))
@@ -252,6 +364,7 @@ extension OverlayContainerView: StickerViewDelegate {
         let bin = trash()
         if draggedSticker !== sticker {
             draggedSticker = sticker
+            updateCanvasClip()
             bin.center = trashCenter
             // Above the stickers, including the one being dragged, so the bin
             // stays visible under a large sticker.
@@ -276,6 +389,11 @@ extension OverlayContainerView: StickerViewDelegate {
         // An interrupted gesture (a call, a system alert) must never delete.
         let dropped = !cancelled && isOverTrash(location)
         draggedSticker = nil
+        // Clip again once the bin — and a sticker dropped into it — have gone:
+        // both animate outside the canvas.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.updateCanvasClip()
+        }
         isTrashArmed = false
         if wasDragging { delegate?.overlayContainer(self, isDraggingSticker: false) }
 

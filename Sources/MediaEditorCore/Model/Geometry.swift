@@ -54,6 +54,13 @@ public struct NormalizedRect: Codable, Equatable, Sendable {
 
     /// The full canvas: `(0, 0)` origin with unit size.
     public static let full = NormalizedRect(x: 0, y: 0, width: 1, height: 1)
+
+    /// Whether `other` is the same rect but for floating-point noise — what a
+    /// round trip through screen points leaves behind.
+    public func isClose(to other: NormalizedRect, tolerance: Double = 1e-6) -> Bool {
+        abs(origin.x - other.origin.x) <= tolerance && abs(origin.y - other.origin.y) <= tolerance
+            && abs(size.width - other.size.width) <= tolerance && abs(size.height - other.size.height) <= tolerance
+    }
 }
 
 /// Placement of an overlay relative to the canvas: a normalized center plus a
