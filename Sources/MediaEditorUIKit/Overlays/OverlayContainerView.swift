@@ -73,24 +73,29 @@ final class OverlayContainerView: UIView {
         didSet { updateCanvasClip() }
     }
 
-    /// Called for a horizontal swipe that starts on empty canvas — a session
-    /// pages between its items with it. Setting it adds the recognizers.
-    var onSwipe: ((UISwipeGestureRecognizer.Direction) -> Void)? {
-        didSet {
-            guard onSwipe != nil, swipeRecognizers.isEmpty else { return }
-            for direction in [UISwipeGestureRecognizer.Direction.left, .right] {
-                let swipe = UISwipeGestureRecognizer(target: self, action: #selector(handleSwipe(_:)))
-                swipe.direction = direction
-                swipe.delegate = self
-                addGestureRecognizer(swipe)
-                swipeRecognizers.append(swipe)
-            }
-        }
-    }
-    private var swipeRecognizers: [UISwipeGestureRecognizer] = []
+    /// Called through a one-finger drag that starts on empty canvas — a
+    /// session pages between its items with it, and zoomed-in media pans.
+    var onCanvasPan: ((UIPanGestureRecognizer) -> Void)?
+    /// The recognizer behind `onCanvasPan`, for the editor to switch between
+    /// paging and panning, or off.
+    let canvasPan = PagingPanGestureRecognizer(target: nil, action: nil)
 
-    @objc private func handleSwipe(_ gesture: UISwipeGestureRecognizer) {
-        onSwipe?(gesture.direction)
+    @objc private func handleCanvasPan(_ gesture: UIPanGestureRecognizer) {
+        onCanvasPan?(gesture)
+    }
+
+    /// Called through a pinch while no sticker is selected — the media zooms
+    /// with it. With a sticker selected, a pinch scales the sticker instead.
+    var onCanvasPinch: ((UIPinchGestureRecognizer) -> Void)?
+    /// Whether the pinch in progress belongs to the canvas, decided as it
+    /// begins so selecting a sticker mid-pinch doesn't hand it over.
+    private var pinchIsCanvas = false
+
+    /// Called for a double tap on empty canvas, with its location here.
+    var onCanvasDoubleTap: ((CGPoint) -> Void)?
+
+    @objc private func handleCanvasDoubleTap(_ gesture: UITapGestureRecognizer) {
+        onCanvasDoubleTap?(gesture.location(in: self))
     }
 
     /// Whether the stickers are clipped to the media right now.
@@ -150,9 +155,6 @@ final class OverlayContainerView: UIView {
         canvasLayer.clipsToBounds = true
         addSubview(canvasLayer)
         canvasLayer.addSubview(drawingView)
-        let tap = UITapGestureRecognizer(target: self, action: #selector(backgroundTapped))
-        tap.cancelsTouchesInView = false
-        addGestureRecognizer(tap)
 
         // Pinch / rotate anywhere transform the selected sticker, so scaling a
         // small sticker doesn't require landing both fingers on it.
@@ -162,7 +164,26 @@ final class OverlayContainerView: UIView {
             gesture.delegate = self
             addGestureRecognizer(gesture)
         }
+
+        canvasPan.addTarget(self, action: #selector(handleCanvasPan(_:)))
+        canvasPan.delegate = self
+        addGestureRecognizer(canvasPan)
+
+        let doubleTap = UITapGestureRecognizer(target: self, action: #selector(handleCanvasDoubleTap(_:)))
+        doubleTap.numberOfTapsRequired = 2
+        doubleTap.delegate = self
+        addGestureRecognizer(doubleTap)
+        canvasDoubleTap = doubleTap
+
+        // A double tap zooms; it shouldn't also toggle a video's playback
+        // twice on the way.
+        let tap = UITapGestureRecognizer(target: self, action: #selector(backgroundTapped))
+        tap.cancelsTouchesInView = false
+        tap.require(toFail: doubleTap)
+        addGestureRecognizer(tap)
     }
+
+    private var canvasDoubleTap: UITapGestureRecognizer?
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
@@ -326,6 +347,11 @@ final class OverlayContainerView: UIView {
     // MARK: - Container-wide transform gestures
 
     @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
+        if gesture.state == .began { pinchIsCanvas = selected == nil }
+        if pinchIsCanvas {
+            onCanvasPinch?(gesture)
+            return
+        }
         guard let selected else { return }
         switch gesture.state {
         case .changed:
@@ -353,18 +379,22 @@ final class OverlayContainerView: UIView {
 }
 
 extension OverlayContainerView: UIGestureRecognizerDelegate {
-    // Pinch + rotate (and the selected sticker's pan) run together.
+    // Pinch + rotate (and the selected sticker's pan) run together, and so
+    // does panning zoomed-in media. Paging runs alone: a page turn shouldn't
+    // also nudge a sticker.
     nonisolated func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                                        shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
-        true
+        MainActor.assumeIsolated {
+            !([gestureRecognizer, other].contains { ($0 as? PagingPanGestureRecognizer)?.pagesItems == true })
+        }
     }
 
-    // A swipe pages between items only from empty canvas: one that starts on a
-    // sticker is that sticker's drag.
+    // Paging, panning and double-tap zoom act on the media only from empty
+    // canvas: a drag that starts on a sticker is that sticker's drag.
     nonisolated func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                                        shouldReceive touch: UITouch) -> Bool {
         MainActor.assumeIsolated {
-            guard gestureRecognizer is UISwipeGestureRecognizer else { return true }
+            guard gestureRecognizer === canvasPan || gestureRecognizer === canvasDoubleTap else { return true }
             return touch.view === self || touch.view === canvasLayer
         }
     }

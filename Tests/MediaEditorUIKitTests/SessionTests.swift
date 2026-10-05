@@ -15,6 +15,7 @@
 import UIKit
 import AVFoundation
 import Testing
+import SwiftUI
 import MediaEditorCore
 @testable import MediaEditorUIKit
 
@@ -208,18 +209,179 @@ struct SessionTests {
         #expect(try #require(session(items, appearance: appearance).strip).backgroundColor == .darkGray)
     }
 
-    @Test("A swipe on empty canvas pages between items")
-    func swipePages() throws {
+    @Test("Dragging past halfway turns the page; a short drag springs back")
+    func dragPages() async throws {
         let a = MediaEditorItem(source: .photo(photo()))
         let b = MediaEditorItem(source: .photo(photo()))
         let editor = session([a, b])
-        let canvas = try #require(editor.view.subviews.first { $0 is OverlayContainerView } as? OverlayContainerView)
-        canvas.onSwipe?(.left)
-        #expect(editor.selectedItemID == b.id)
-        canvas.onSwipe?(.left)
+        let width = editor.view.bounds.width
+
+        editor.beginPaging()
+        editor.updatePaging(translation: -width * 0.3)
+        editor.endPaging(velocity: 0)
+        try await waitUntil { !editor.isPaging }
+        #expect(editor.selectedItemID == a.id, "not far enough, nor fast enough")
+
+        editor.beginPaging()
+        editor.updatePaging(translation: -width * 0.2)
+        editor.endPaging(velocity: -2000)
+        try await waitUntil { !editor.isPaging }
+        #expect(editor.selectedItemID == b.id, "a flick carries a short drag over")
+
+        editor.beginPaging()
+        editor.updatePaging(translation: -width * 0.8)
+        editor.endPaging(velocity: 0)
+        try await waitUntil { !editor.isPaging }
         #expect(editor.selectedItemID == b.id, "nothing past the last item")
-        canvas.onSwipe?(.right)
+
+        editor.beginPaging()
+        editor.updatePaging(translation: width * 0.6)
+        editor.endPaging(velocity: 0)
+        try await waitUntil { !editor.isPaging }
         #expect(editor.selectedItemID == a.id)
+    }
+
+    @Test("A page turn lays its track below the chrome and clears it after")
+    func pagingTrack() async throws {
+        let a = MediaEditorItem(source: .photo(photo()))
+        let b = MediaEditorItem(source: .photo(photo()))
+        let editor = session([a, b])
+        let before = editor.view.subviews.count
+        editor.beginPaging()
+        #expect(editor.isPaging)
+        #expect(editor.view.subviews.count == before + 1)
+        let track = try #require(editor.view.subviews.first { !$0.isUserInteractionEnabled && $0.frame == editor.view.bounds })
+        let strip = try #require(editor.strip)
+        let order = editor.view.subviews
+        #expect(try #require(order.firstIndex(of: track)) < #require(order.firstIndex(of: strip)))
+        editor.updatePaging(translation: -editor.view.bounds.width * 0.7)
+        // The pages move; what covers the live canvas doesn't, so the canvas
+        // can't show at the edge they've left.
+        #expect(track.frame == editor.view.bounds)
+        #expect(track.transform == .identity)
+        #expect(try #require(track.subviews.first).transform.tx < 0)
+        editor.endPaging(velocity: 0)
+        try await waitUntil { editor.view.subviews.count == before }
+        #expect(editor.selectedItemID == b.id)
+    }
+
+    @Test("Passthrough content with a tiny ideal size can't squash the canvas")
+    func passthroughKeepsCanvas() throws {
+        // A document viewer's hosting view: a few points ideal, hugging them
+        // harder than the bar does — at equal priorities which side gives way
+        // is down to Auto Layout, and on device it was the canvas.
+        let preview: @MainActor @Sendable () -> UIView = {
+            let view = UIHostingController(rootView: Color.clear.frame(width: 10, height: 10)).view!
+            view.setContentHuggingPriority(.defaultHigh, for: .vertical)
+            return view
+        }
+        let items = [MediaEditorItem(source: .passthrough(thumbnail: nil, preview: preview)),
+                     MediaEditorItem(source: .passthrough(thumbnail: nil, preview: preview))]
+        // Like a host's SwiftUI bar: sized only by its intrinsic height,
+        // which Auto Layout may stretch at default priorities.
+        let accessory = UIHostingController(rootView: Color.clear.frame(height: 100)).view!
+        let editor = session(items, accessory: accessory)
+        editor.view.layoutIfNeeded()
+
+        let strip = try #require(editor.strip)
+        let canvas = try #require(editor.view.subviews.first { $0 is UIImageView && $0.frame.width > 200 })
+        #expect(canvas.frame.height > 300, "the canvas fills down towards the strip")
+        #expect(strip.frame.minY > editor.view.bounds.midY, "the strip stays at the bottom")
+        #expect(abs(accessory.safeAreaLayoutGuide.layoutFrame.height - 100) < 1, "the bar keeps its content height")
+    }
+
+    @Test("An incoming video slides in where it will sit, above its controls")
+    func incomingVideoLandsInPlace() async throws {
+        // Tall, so the box above the controls is what limits it.
+        let source = try await VideoFixture.make(width: 200, height: 600, seconds: 1)
+        let editor = session([MediaEditorItem(source: .photo(photo())), MediaEditorItem(source: .video(source))])
+        let width = editor.view.bounds.width
+
+        editor.beginPaging()
+        let track = try #require(editor.view.subviews.first { $0.frame == editor.view.bounds && !$0.isUserInteractionEnabled })
+        let page = try #require(track.subviews.first?.subviews.compactMap { $0 as? UIImageView }
+            .first { $0.frame.minX > width / 2 })
+        // The page's picture is fitted into its frame, as the player will be.
+        let incoming = AVMakeRect(aspectRatio: CGSize(width: 200, height: 600),
+                                  insideRect: page.frame.offsetBy(dx: -width, dy: 0))
+        editor.updatePaging(translation: -width * 0.7)
+        editor.endPaging(velocity: 0)
+        try await waitUntil { !editor.isPaging && editor.videoOrientedSize != .zero }
+        editor.view.layoutIfNeeded()
+
+        let (canvas, _) = try canvas(of: editor)
+        let player = try #require(canvas.subviews.first)
+        let live = editor.view.convert(player.bounds, from: player)
+        #expect(abs(live.minY - incoming.minY) < 1.5, "no jump up or down as the player takes over")
+        #expect(abs(live.height - incoming.height) < 1.5)
+    }
+
+    // MARK: - Zoom
+
+    private func canvas(of editor: MediaEditorViewController) throws -> (UIImageView, OverlayContainerView) {
+        let image = try #require(editor.view.subviews.first { $0 is UIImageView && $0.bounds.width > 200 } as? UIImageView)
+        let overlay = try #require(editor.view.subviews.first { $0 is OverlayContainerView } as? OverlayContainerView)
+        return (image, overlay)
+    }
+
+    @Test("A double tap zooms the media and its edits together, and a second one zooms back out")
+    func doubleTapZooms() throws {
+        let editor = session([MediaEditorItem(source: .photo(photo(size: CGSize(width: 4000, height: 3000)))),
+                              MediaEditorItem(source: .photo(photo()))])
+        let (image, overlay) = try canvas(of: editor)
+        let unzoomedPixels = try #require(image.image).size.width
+
+        editor.handleCanvasDoubleTap(at: CGPoint(x: overlay.bounds.midX, y: overlay.bounds.midY))
+        #expect(editor.isZoomed)
+        #expect(image.transform.a == 2.5)
+        #expect(overlay.transform == image.transform, "stickers and drawing zoom with the media")
+        #expect(try #require(image.image).size.width > unzoomedPixels * 2, "re-rendered sharper for the zoom")
+        #expect(!overlay.canvasPan.pagesItems, "a drag pans the zoomed media instead of paging")
+
+        editor.handleCanvasDoubleTap(at: .zero)
+        #expect(!editor.isZoomed)
+        #expect(image.transform == .identity)
+        #expect(overlay.canvasPan.pagesItems)
+    }
+
+    @Test("Zoomed media can't be moved past its own edges")
+    func zoomStaysOnTheMedia() throws {
+        let editor = session([MediaEditorItem(source: .photo(photo(size: CGSize(width: 400, height: 400))))])
+        let (image, overlay) = try canvas(of: editor)
+        // A tap in the far corner: centring it would pull the media's edge in.
+        editor.handleCanvasDoubleTap(at: .zero)
+        let zoomed = image.frame
+        let preview = CGRect(x: image.center.x - image.bounds.width / 2, y: image.center.y - image.bounds.height / 2,
+                             width: image.bounds.width, height: image.bounds.height)
+        // A square photo fills the preview's width: zoomed, it still covers it.
+        #expect(zoomed.minX <= preview.minX + 0.5)
+        #expect(zoomed.maxX >= preview.maxX - 0.5)
+        #expect(overlay.transform == image.transform)
+    }
+
+    @Test("Switching items, turning a page or opening a tool resets the zoom")
+    func zoomResets() async throws {
+        let a = MediaEditorItem(source: .photo(photo()))
+        let b = MediaEditorItem(source: .photo(photo()))
+        let editor = session([a, b])
+        let (image, _) = try canvas(of: editor)
+        let center = CGPoint(x: image.bounds.midX, y: image.bounds.midY)
+
+        editor.handleCanvasDoubleTap(at: center)
+        editor.select(b.id)
+        #expect(!editor.isZoomed)
+        #expect(image.transform == .identity)
+
+        editor.handleCanvasDoubleTap(at: center)
+        editor.beginPaging()
+        #expect(!editor.isZoomed)
+        editor.endPaging(velocity: 0, cancelled: true)
+        try await waitUntil { !editor.isPaging }
+
+        editor.handleCanvasDoubleTap(at: center)
+        editor.enterCropMode()
+        #expect(!editor.isZoomed)
+        #expect(image.transform == .identity)
     }
 
     // MARK: - Finishing
