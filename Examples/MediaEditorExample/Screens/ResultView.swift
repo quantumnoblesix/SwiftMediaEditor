@@ -51,7 +51,22 @@ struct ResultView: View {
 
     @ViewBuilder
     private var preview: some View {
-        switch session.result {
+        if session.results.count > 1 {
+            // A multi-item send: page through what was sent.
+            TabView {
+                ForEach(session.results.indices, id: \.self) { index in
+                    page(for: session.results[index])
+                }
+            }
+            .tabViewStyle(.page(indexDisplayMode: .always))
+        } else {
+            page(for: session.result)
+        }
+    }
+
+    @ViewBuilder
+    private func page(for result: MediaResult?) -> some View {
+        switch result {
         case let .photo(image):
             Image(uiImage: image).resizable().scaledToFit()
         case let .video(url):

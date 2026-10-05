@@ -73,6 +73,26 @@ final class OverlayContainerView: UIView {
         didSet { updateCanvasClip() }
     }
 
+    /// Called for a horizontal swipe that starts on empty canvas — a session
+    /// pages between its items with it. Setting it adds the recognizers.
+    var onSwipe: ((UISwipeGestureRecognizer.Direction) -> Void)? {
+        didSet {
+            guard onSwipe != nil, swipeRecognizers.isEmpty else { return }
+            for direction in [UISwipeGestureRecognizer.Direction.left, .right] {
+                let swipe = UISwipeGestureRecognizer(target: self, action: #selector(handleSwipe(_:)))
+                swipe.direction = direction
+                swipe.delegate = self
+                addGestureRecognizer(swipe)
+                swipeRecognizers.append(swipe)
+            }
+        }
+    }
+    private var swipeRecognizers: [UISwipeGestureRecognizer] = []
+
+    @objc private func handleSwipe(_ gesture: UISwipeGestureRecognizer) {
+        onSwipe?(gesture.direction)
+    }
+
     /// Whether the stickers are clipped to the media right now.
     var isClippingToCanvas: Bool { canvasLayer.clipsToBounds }
 
@@ -337,6 +357,16 @@ extension OverlayContainerView: UIGestureRecognizerDelegate {
     nonisolated func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                                        shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
         true
+    }
+
+    // A swipe pages between items only from empty canvas: one that starts on a
+    // sticker is that sticker's drag.
+    nonisolated func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                                       shouldReceive touch: UITouch) -> Bool {
+        MainActor.assumeIsolated {
+            guard gestureRecognizer is UISwipeGestureRecognizer else { return true }
+            return touch.view === self || touch.view === canvasLayer
+        }
     }
 }
 

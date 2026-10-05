@@ -43,6 +43,9 @@ final class TrimScrubberView: UIView {
     private(set) var trimEnd: Double = 0
 
     private let filmstrip = UIStackView()
+    /// Bumped on every `configure`, so thumbnails still being made for a
+    /// previous asset are dropped rather than added to the new one.
+    private var configuration = 0
     // The frame and its draggable edges. Internal so tests can check their styling.
     let leftHandle = UIView()
     let rightHandle = UIView()
@@ -163,16 +166,22 @@ final class TrimScrubberView: UIView {
 
     /// Sets the asset duration and initial trim (full range) and kicks off
     /// asynchronous thumbnail generation.
+    /// Safe to call again for another asset — the editor reuses one scrubber
+    /// across the videos of a session.
     func configure(asset: AVAsset, duration: Double) {
         self.duration = max(duration, 0.01)
         self.trimStart = 0
         self.trimEnd = self.duration
+        configuration += 1
+        filmstrip.arrangedSubviews.forEach { $0.removeFromSuperview() }
         setNeedsLayout()
 
         let assetBox = UnsafeSendable(asset)
         let total = self.duration
+        let current = configuration
         Task {
             let thumbnails = await Self.makeThumbnails(assetBox: assetBox, duration: total)
+            guard current == configuration else { return }
             installThumbnails(thumbnails.map(\.value))
         }
     }

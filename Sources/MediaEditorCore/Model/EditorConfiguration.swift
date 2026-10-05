@@ -57,6 +57,17 @@ public enum VideoExportPreset: Sendable {
     case custom(String)
 }
 
+/// What the turnkey editor does when the user confirms a session.
+public enum MediaEditorFinishMode: Sendable, Hashable {
+    /// Render every edited item before reporting back: photos in one pass each,
+    /// videos exported behind a progress panel.
+    case render
+    /// Report back straight away with the recipes only, and render nothing. The
+    /// host renders later — in the background, say — with `EditRenderer`. This
+    /// is what a chat app wants: close the screen on send, upload afterwards.
+    case recipesOnly
+}
+
 /// Configuration for a turnkey editor session. UI-framework agnostic so it can
 /// live in Core and be shared by both the UIKit and SwiftUI entry points.
 public struct EditorConfiguration: Sendable {
@@ -92,8 +103,11 @@ public struct EditorConfiguration: Sendable {
     /// destinations never need those pixels. Capping to 1080p or 720p is the
     /// most effective lever for older hardware.
     public var maximumExportDimension: CGFloat?
-    /// Undo/redo history depth.
+    /// Undo/redo history depth — for each item, in a multi-item session.
     public var historyLimit: Int
+    /// Whether confirming a multi-item session renders its items or hands back
+    /// recipes only. The single-item editor always renders, as it always has.
+    public var finishMode: MediaEditorFinishMode
 
     public init(
         photoTools: EditorTools = .allPhoto,
@@ -102,7 +116,8 @@ public struct EditorConfiguration: Sendable {
                                          .ratio(width: 16, height: 9), .ratio(width: 9, height: 16)],
         videoExportPreset: VideoExportPreset = .hevcHighQuality,
         maximumExportDimension: CGFloat? = nil,
-        historyLimit: Int = 50
+        historyLimit: Int = 50,
+        finishMode: MediaEditorFinishMode = .render
     ) {
         self.photoTools = photoTools
         self.videoTools = videoTools
@@ -110,6 +125,7 @@ public struct EditorConfiguration: Sendable {
         self.videoExportPreset = videoExportPreset
         self.maximumExportDimension = maximumExportDimension
         self.historyLimit = historyLimit
+        self.finishMode = finishMode
     }
 
     /// The tools the editor offers for `kind`: that kind's configured set, less

@@ -22,6 +22,11 @@ import MediaEditorCore
 /// a previously-saved `EditRecipe` to resume), and receive an `EditorResult`
 /// through `onFinish`.
 ///
+/// Or hand it several items — ``init(items:selectedItemID:configuration:appearance:toolbarProvider:bottomAccessory:onFinish:)``
+/// — and it edits them as one session: a thumbnail strip moves between them,
+/// each keeps its own edits and undo history, and the session ends with one
+/// result per item.
+///
 /// Photos get the geometry tools (crop / rotate / flip) with a live preview
 /// driven by the non-destructive `EditRecipe` + `PhotoRenderer`, plus filters,
 /// drawing, overlays, undo/redo, and save. Videos get the crop tool, drawing and
@@ -30,12 +35,69 @@ import MediaEditorCore
 @MainActor
 public final class MediaEditorViewController: UIViewController {
 
-    /// The media being edited.
-    public let item: MediaItem
+    /// The media being edited — in a multi-item session, the selected item's.
+    /// A file-backed photo appears here once decoded; passthrough content has
+    /// no editable media, so look at ``selectedItem`` for that.
+    public private(set) var item: MediaItem
     /// Editor configuration (enabled tools, aspect presets, export settings).
     public let configuration: EditorConfiguration
-    /// Called once when the session ends, on the main actor.
+    /// Called once when a single-item editor ends, on the main actor.
     public var onFinish: ((EditorResult) -> Void)?
+    /// Called once when a multi-item session ends, on the main actor.
+    public var onSessionFinish: ((MediaEditorSessionResult) -> Void)?
+
+    // MARK: Session
+
+    /// The session's items in strip order, with their current recipes. The
+    /// selected item's recipe is its committed working recipe — never the
+    /// half-applied state of an open tool.
+    public private(set) var items: [MediaEditorItem]
+    /// The item on the canvas.
+    public private(set) var selectedItemID: UUID
+    /// The item on the canvas, with its current recipe.
+    public var selectedItem: MediaEditorItem { items[selectedIndex] }
+
+    /// Called after the selection changes — a strip tap, a swipe, a removal or
+    /// `select(_:)`.
+    public var onSelectionChange: ((UUID) -> Void)?
+    /// Called after items are removed, reordered or inserted.
+    public var onItemsChange: (([MediaEditorItem]) -> Void)?
+    /// Called after every committed change to the selected item's recipe —
+    /// an applied tool, a sticker moved, undo or redo — but not for the recipe
+    /// an item starts with.
+    public var onRecipeChange: ((UUID, EditRecipe) -> Void)?
+    /// When set, the strip ends with a "+" cell that calls this, and stays on
+    /// screen even for one item. Present your own picker and call
+    /// `insert(_:at:)` with what the user picks.
+    public var onAddItems: (() -> Void)? {
+        didSet { if isViewLoaded { updateStrip() } }
+    }
+
+    /// A single-item editor: no strip, and it reports through `onFinish`.
+    private let isSingleItemEditor: Bool
+    private var selectedIndex: Int { items.firstIndex { $0.id == selectedItemID } ?? 0 }
+    /// Undo histories of the items that aren't selected, kept for the session.
+    private var histories: [UUID: EditHistory<EditRecipe>] = [:]
+    /// Set while an item is being loaded, so restoring its recipe isn't
+    /// reported as a change.
+    private var isLoadingSelection = false
+    /// The selected item can't be edited — its own view is on the canvas.
+    private var isPassthrough = false
+    private let passthroughHost = UIView()
+    private var passthroughView: UIView?
+    /// Decodes a file-backed photo off the main actor.
+    private var photoLoadTask: Task<Void, Never>?
+    /// Loads the selected video's duration, tracks and size.
+    private var videoLoadTask: Task<Void, Never>?
+    private lazy var thumbnailStrip = ThumbnailStripView(appearance: appearance)
+    /// Renders strip thumbnails one at a time.
+    private var thumbnailTask: Task<Void, Never>?
+    private var thumbnailQueue: [UUID] = []
+    /// The recipe each strip thumbnail was rendered for.
+    private var thumbnailRecipes: [UUID: EditRecipe] = [:]
+    private var thumbnailDebounce: Task<Void, Never>?
+    /// The rendering path shared with `EditRenderer`'s hosts.
+    private lazy var editRenderer = EditRenderer(configuration: configuration)
 
     /// How the built-in chrome is styled. Set through `init`; changing it after
     /// the view loads has no effect on bars already built.
@@ -59,7 +121,7 @@ public final class MediaEditorViewController: UIViewController {
     /// Undo/redo history over the working recipe.
     private var history: EditHistory<EditRecipe>
 
-    /// The current working recipe.
+    /// The current working recipe — the selected item's.
     public private(set) var recipe: EditRecipe {
         didSet {
             // Overlays are live views over the render, so an overlay-only edit
@@ -69,16 +131,20 @@ public final class MediaEditorViewController: UIViewController {
             if case .video = item, isViewLoaded {
                 syncVideoState()
             }
+            if recipe != oldValue, !isLoadingSelection, items.indices.contains(selectedIndex) {
+                items[selectedIndex].recipe = recipe
+                onRecipeChange?(selectedItemID, recipe)
+                scheduleThumbnailRefresh(for: selectedItemID)
+            }
         }
     }
 
     // MARK: - Rendering
 
     private let renderer = PhotoRenderer()
-    private let overlayCompositor = OverlayCompositor()
     private let drawingCompositor = DrawingCompositor()
     /// The orientation-normalized source image (photos only).
-    private let sourceImage: UIImage?
+    private var sourceImage: UIImage?
     private var sourceCGImage: CGImage?
     /// `sourceCGImage` scaled down to roughly what the preview can actually
     /// show, and the cap it was built for.
@@ -103,6 +169,14 @@ public final class MediaEditorViewController: UIViewController {
         let v = UIImageView()
         v.contentMode = .scaleAspectFit
         v.translatesAutoresizingMaskIntoConstraints = false
+        // The preview fills whatever the chrome leaves. Left at their defaults,
+        // an image view's priorities let a large image — a full-size decode is
+        // thousands of points tall — out-bid the bottom accessory's own
+        // intrinsic height, and Auto Layout squashes the accessory instead.
+        for axis in [NSLayoutConstraint.Axis.horizontal, .vertical] {
+            v.setContentHuggingPriority(.init(1), for: axis)
+            v.setContentCompressionResistancePriority(.init(1), for: axis)
+        }
         return v
     }()
 
@@ -122,7 +196,6 @@ public final class MediaEditorViewController: UIViewController {
     /// The drawing on screen — the recipe's, or in crop mode its whole-frame
     /// carry.
     private var shownDrawing: DrawingData?
-    private let videoArtworkRenderer = VideoArtworkRenderer()
     /// The video's oriented display size, resolved once the asset loads.
     /// Internal so tests can stand in for a real asset.
     var videoOrientedSize: CGSize = .zero
@@ -132,7 +205,6 @@ public final class MediaEditorViewController: UIViewController {
     }
 
     // Video editing state.
-    private let composer = VideoComposer()
     private var videoAsset: AVURLAsset?
     private lazy var trimScrubber = TrimScrubberView(appearance: appearance)
     private var displayLink: CADisplayLink?
@@ -176,10 +248,28 @@ public final class MediaEditorViewController: UIViewController {
     /// The Done button, when `toolbarPlacement` is `.top` and pushes it down to
     /// the bottom trailing corner.
     private var floatingDoneButton: UIButton?
-    /// Reserves the accessory's resting height above the bottom safe area. The
-    /// accessory itself follows the keyboard; the preview and video controls
-    /// lay out against this instead, so they stay put while the user types.
+    /// Everything reserved along the bottom: the accessory's resting height
+    /// and, above it, the thumbnail strip. The accessory itself follows the
+    /// keyboard; the preview and video controls lay out against this instead,
+    /// so they stay put while the user types.
     private let bottomChromeGuide = UILayoutGuide()
+    /// The accessory's share of `bottomChromeGuide`.
+    private let accessoryGuide = UILayoutGuide()
+    /// The strip's share of `bottomChromeGuide`, directly above the accessory.
+    private let stripGuide = UILayoutGuide()
+    private var stripHeightConstraint: NSLayoutConstraint?
+    /// Tracks the accessory's content height while the keyboard is down…
+    private var accessoryLiveHeight: NSLayoutConstraint?
+    /// …and holds it while the keyboard is up, so a bar that grows as the user
+    /// types — more caption lines, a list of suggestions — draws over the media
+    /// instead of shrinking it, and nothing behind it jumps or re-renders.
+    private var accessoryFrozenHeight: NSLayoutConstraint?
+    private var isKeyboardUp = false
+    /// Whether the session shows its strip at all: two or more items, or a "+"
+    /// cell to reach.
+    private var stripIsInUse = false
+    /// A tool (crop, drawing, filters) has the screen.
+    private var isToolOpen = false
 
     // Overlay (sticker) layer, above the image preview.
     private let overlayContainer = OverlayContainerView()
@@ -248,7 +338,7 @@ public final class MediaEditorViewController: UIViewController {
     ///     action: with an accessory installed the editor shows no Done button of
     ///     its own. It is hidden while a tool (crop, drawing, filters) is open.
     ///   - onFinish: completion handler delivering the result.
-    public init(
+    public convenience init(
         item: MediaItem,
         recipe: EditRecipe = .identity,
         configuration: EditorConfiguration = .default,
@@ -257,21 +347,69 @@ public final class MediaEditorViewController: UIViewController {
         bottomAccessory: UIView? = nil,
         onFinish: ((EditorResult) -> Void)? = nil
     ) {
-        self.item = item
+        self.init(items: [MediaEditorItem(source: MediaSource(item), recipe: recipe)], selectedItemID: nil,
+                  configuration: configuration, appearance: appearance, toolbarProvider: toolbarProvider,
+                  bottomAccessory: bottomAccessory, isSingleItemEditor: true)
+        self.onFinish = onFinish
+    }
+
+    /// Edits several items as one session — say, the photos and videos picked
+    /// for a chat message. A thumbnail strip moves between them; each keeps its
+    /// own edits and undo history.
+    ///
+    /// Confirming renders every edited item, or with
+    /// `EditorConfiguration.finishMode` set to `.recipesOnly` hands back the
+    /// recipes straight away for the host to render later with
+    /// ``EditRenderer``. Removing the last item ends the session with
+    /// `.cancelled`.
+    ///
+    /// - Parameters:
+    ///   - items: what to edit, in strip order. Must not be empty.
+    ///   - selectedItemID: the item shown first; `nil` for the first one.
+    ///   - configuration: enabled tools, export settings and the finish mode.
+    ///   - appearance: how the chrome and the strip are styled.
+    ///   - toolbarProvider: supplies a replacement tool row; it's offered the
+    ///     actions of every kind of media in the session and should reflect
+    ///     `isEnabled(_:)` for the selected one.
+    ///   - bottomAccessory: a bar the host owns, as for the single-item editor.
+    ///     The strip sits directly above it.
+    ///   - onFinish: called once with the session's result.
+    public convenience init(
+        items: [MediaEditorItem],
+        selectedItemID: UUID? = nil,
+        configuration: EditorConfiguration = .default,
+        appearance: EditorAppearance = .default,
+        toolbarProvider: (any MediaEditorToolbarProviding)? = nil,
+        bottomAccessory: UIView? = nil,
+        onFinish: ((MediaEditorSessionResult) -> Void)? = nil
+    ) {
+        self.init(items: items, selectedItemID: selectedItemID, configuration: configuration,
+                  appearance: appearance, toolbarProvider: toolbarProvider,
+                  bottomAccessory: bottomAccessory, isSingleItemEditor: false)
+        self.onSessionFinish = onFinish
+    }
+
+    private init(
+        items: [MediaEditorItem],
+        selectedItemID: UUID?,
+        configuration: EditorConfiguration,
+        appearance: EditorAppearance,
+        toolbarProvider: (any MediaEditorToolbarProviding)?,
+        bottomAccessory: UIView?,
+        isSingleItemEditor: Bool
+    ) {
+        precondition(!items.isEmpty, "A media editor session needs at least one item.")
+        let selected = items.first { $0.id == selectedItemID } ?? items[0]
+        self.items = items
+        self.selectedItemID = selected.id
+        self.isSingleItemEditor = isSingleItemEditor
+        self.item = .photo(UIImage())                 // replaced by `prepareSelectedMedia`
         self.configuration = configuration
         self.appearance = appearance
         self.toolbarProvider = toolbarProvider
         self.bottomAccessory = bottomAccessory
-        self.recipe = recipe
-        self.history = EditHistory(initial: recipe, limit: configuration.historyLimit)
-        if case let .photo(image) = item {
-            let normalized = image.normalizedUp()
-            self.sourceImage = normalized
-            self.sourceCGImage = normalized.cgImage
-        } else {
-            self.sourceImage = nil
-            self.sourceCGImage = nil
-        }
+        self.recipe = selected.recipe
+        self.history = EditHistory(initial: selected.recipe, limit: configuration.historyLimit)
         super.init(nibName: nil, bundle: nil)
         modalPresentationStyle = .fullScreen
         // The editor is dark whatever the system setting — media reads best on
@@ -284,13 +422,7 @@ public final class MediaEditorViewController: UIViewController {
         // PencilKit would otherwise adapt them (black shown as white), and the
         // user would pick a colour the result doesn't have.
         toolPicker.colorUserInterfaceStyle = .light
-        // Restore image-overlay content from a resumed recipe.
-        for overlay in recipe.overlays {
-            if case let .image(ref) = overlay.content, let data = ref.data,
-               let image = UIImage(data: data) {
-                overlayImages[ref.id] = image
-            }
-        }
+        prepareSelectedMedia()
     }
 
     @available(*, unavailable)
@@ -318,12 +450,23 @@ public final class MediaEditorViewController: UIViewController {
         setupDrawChrome()
         setupFilterChrome()
         setupPreview()
+        setupStrip()
         liftChromeAbovePreview()
         renderPreview()
         overlayContainer.reload(overlays: recipe.overlays, images: overlayImages)
         updateDrawingLayer()
         updateHistoryButtons()
         updateHistoryVisibility(animated: false)
+        refreshMainChrome()
+    }
+
+    public override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        // Leaving the screen shouldn't leave a video playing behind it. Only
+        // pause: a host that pops back to the editor finds it as it was.
+        player?.pause()
+        syncTransport(animated: false)
+        if mode == .draw { toolPicker.setVisible(false, forFirstResponder: canvasView) }
     }
 
     public override func viewDidLayoutSubviews() {
@@ -341,6 +484,10 @@ public final class MediaEditorViewController: UIViewController {
 
     public override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        if mode == .draw {
+            toolPicker.setVisible(true, forFirstResponder: canvasView)
+            canvasView.becomeFirstResponder()
+        }
         // UI-test / demo affordance: auto-enter crop for screenshotting. Inert
         // unless the host launches with this argument.
         if ProcessInfo.processInfo.arguments.contains("-MEStartInCrop"),
@@ -382,6 +529,18 @@ public final class MediaEditorViewController: UIViewController {
             previewBottomConstraint(),
         ])
 
+        // Passthrough content — a GIF, a document — fills the preview area in
+        // place of the image.
+        passthroughHost.translatesAutoresizingMaskIntoConstraints = false
+        passthroughHost.isHidden = true
+        view.addSubview(passthroughHost)
+        NSLayoutConstraint.activate([
+            passthroughHost.leadingAnchor.constraint(equalTo: imageView.leadingAnchor),
+            passthroughHost.trailingAnchor.constraint(equalTo: imageView.trailingAnchor),
+            passthroughHost.topAnchor.constraint(equalTo: imageView.topAnchor),
+            passthroughHost.bottomAnchor.constraint(equalTo: imageView.bottomAnchor),
+        ])
+
         // Sticker layer floats over the image; positioned in layout passes.
         overlayContainer.delegate = self
         overlayContainer.appearance = appearance
@@ -391,9 +550,16 @@ public final class MediaEditorViewController: UIViewController {
         overlayContainer.clipsToBounds = false
         view.addSubview(overlayContainer)
 
-        if case let .video(url) = item {
-            setupVideo(url: url)
+        if !isSingleItemEditor, appearance.allowsSwipeBetweenItems {
+            overlayContainer.onSwipe = { [weak self] direction in self?.swipe(direction) }
+            for direction in [UISwipeGestureRecognizer.Direction.left, .right] {
+                let swipe = UISwipeGestureRecognizer(target: self, action: #selector(passthroughSwiped(_:)))
+                swipe.direction = direction
+                passthroughHost.addGestureRecognizer(swipe)
+            }
         }
+
+        loadSelectedMediaViews()
     }
 
     /// Where the preview stops. Under a bottom tool row it leaves the row's
@@ -419,7 +585,8 @@ public final class MediaEditorViewController: UIViewController {
     private func liftChromeAbovePreview() {
         view.bringSubviewToFront(topBar)
         view.bringSubviewToFront(historyContainer)
-        for chrome in [toolRowContainer, floatingDoneButton, bottomAccessory] {
+        let strip: UIView? = isSingleItemEditor ? nil : thumbnailStrip
+        for chrome in [toolRowContainer, floatingDoneButton, strip, bottomAccessory] {
             if let chrome, chrome.superview === view { view.bringSubviewToFront(chrome) }
         }
     }
@@ -436,7 +603,8 @@ public final class MediaEditorViewController: UIViewController {
     /// room for the bin's armed swell, spring overshoot included.
     private func trashCenterAboveBottomControls() -> CGPoint? {
         let filmstrip: UIView? = showsTrimScrubber ? trimScrubber : nil
-        let candidates = [videoControlsTop, filmstrip, toolRowAtBottom, floatingDoneButton, bottomAccessory]
+        let strip: UIView? = stripIsInUse ? thumbnailStrip : nil
+        let candidates = [videoControlsTop, filmstrip, toolRowAtBottom, floatingDoneButton, strip, bottomAccessory]
         let tops = candidates.compactMap { control -> CGFloat? in
             // Hidden controls count too: the time readout stays hidden until the
             // clip loads, and the bin should already clear the spot it takes.
@@ -563,16 +731,26 @@ public final class MediaEditorViewController: UIViewController {
     /// top of the keyboard it no longer overlaps the strip, so the inset drops to
     /// zero and there is no gap above the keys.
     private func setupBottomAccessory() {
-        view.addLayoutGuide(bottomChromeGuide)
+        for guide in [accessoryGuide, stripGuide, bottomChromeGuide] { view.addLayoutGuide(guide) }
+        let stripHeight = stripGuide.heightAnchor.constraint(equalToConstant: 0)
+        stripHeightConstraint = stripHeight
         NSLayoutConstraint.activate([
+            accessoryGuide.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            accessoryGuide.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            accessoryGuide.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+
+            stripGuide.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            stripGuide.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            stripGuide.bottomAnchor.constraint(equalTo: accessoryGuide.topAnchor),
+            stripHeight,
+
             bottomChromeGuide.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             bottomChromeGuide.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            bottomChromeGuide.topAnchor.constraint(equalTo: stripGuide.topAnchor),
+            bottomChromeGuide.bottomAnchor.constraint(equalTo: accessoryGuide.bottomAnchor),
         ])
         guard let accessory = bottomAccessory else {
-            NSLayoutConstraint.activate([
-                bottomChromeGuide.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
-                bottomChromeGuide.heightAnchor.constraint(equalToConstant: 0),
-            ])
+            accessoryGuide.heightAnchor.constraint(equalToConstant: 0).isActive = true
             return
         }
         // With the keyboard down the guide rests on the bottom edge rather than
@@ -580,29 +758,61 @@ public final class MediaEditorViewController: UIViewController {
         view.keyboardLayoutGuide.usesBottomSafeArea = false
         accessory.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(accessory)
+        // The bar's content height, above the safe area: resting, the bar also
+        // covers the home-indicator strip; lifted by the keyboard it doesn't.
+        // Measuring its content keeps the guide — and everything laid out on
+        // it — still while the user types.
+        let live = accessoryGuide.heightAnchor.constraint(equalTo: accessory.safeAreaLayoutGuide.heightAnchor)
+        accessoryLiveHeight = live
         NSLayoutConstraint.activate([
             accessory.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             accessory.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             accessory.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor),
-            // The bar's content height, above the safe area: resting, the bar
-            // also covers the home-indicator strip; lifted by the keyboard it
-            // doesn't. Measuring its content keeps the guide — and everything
-            // laid out on it — still while the user types.
-            bottomChromeGuide.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
-            bottomChromeGuide.heightAnchor.constraint(equalTo: accessory.safeAreaLayoutGuide.heightAnchor),
+            live,
         ])
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(keyboardWillShow(_:)),
+                           name: UIResponder.keyboardWillShowNotification, object: nil)
+        center.addObserver(self, selector: #selector(keyboardWillHide(_:)),
+                           name: UIResponder.keyboardWillHideNotification, object: nil)
+    }
+
+    /// The keyboard is coming up: hold the space reserved for the accessory at
+    /// its resting height, and fade the strip if the appearance asks.
+    @objc private func keyboardWillShow(_ notification: Notification) {
+        guard !isKeyboardUp, let live = accessoryLiveHeight else { return }
+        isKeyboardUp = true
+        let frozen = accessoryGuide.heightAnchor.constraint(equalToConstant: accessoryGuide.layoutFrame.height)
+        live.isActive = false
+        frozen.isActive = true
+        accessoryFrozenHeight = frozen
+        applyStripVisibility(animated: true)
+    }
+
+    /// The keyboard is gone: follow the accessory's content height again —
+    /// animated, in case it changed while the user typed.
+    @objc private func keyboardWillHide(_ notification: Notification) {
+        guard isKeyboardUp else { return }
+        isKeyboardUp = false
+        accessoryFrozenHeight?.isActive = false
+        accessoryFrozenHeight = nil
+        accessoryLiveHeight?.isActive = true
+        applyStripVisibility(animated: true)
+        UIView.animate(withDuration: 0.25) { [weak self] in self?.view.layoutIfNeeded() }
     }
 
     /// Builds the tool row — the provider's, when it supplies one — without
     /// placing it; `setupChrome` decides where it goes.
     private func makeToolRow() -> UIView? {
         if let provider = toolbarProvider,
-           let custom = provider.makeToolbar(for: toolbarActions, editor: self) {
+           let custom = provider.makeToolbar(for: isSingleItemEditor ? toolbarActions : sessionToolbarActions,
+                                             editor: self) {
             customToolbar = custom
             return custom
         }
         let buttons = toolbarButtons()
-        guard !buttons.isEmpty else { return nil }
+        // A session may move on to media with tools even if this one has none.
+        guard !buttons.isEmpty || !isSingleItemEditor else { return nil }
 
         toolRow.axis = .horizontal
         toolRow.distribution = .fill
@@ -664,17 +874,10 @@ public final class MediaEditorViewController: UIViewController {
         view.addSubview(cropTopBar)
 
         // Crop tools bar (flip / rotate presets), leading under the top bar.
-        let tools = configuration.tools(for: item.kind)
         cropToolsBar.axis = .horizontal
         cropToolsBar.spacing = 18
         cropToolsBar.alignment = .center
-        if tools.contains(.flip) {
-            cropToolsBar.addArrangedSubview(makeToolButton(.flipHorizontal, selector: #selector(cropFlipHTapped)))
-            cropToolsBar.addArrangedSubview(makeToolButton(.flipVertical, selector: #selector(cropFlipVTapped)))
-        }
-        if tools.contains(.rotate) {
-            cropToolsBar.addArrangedSubview(makeToolButton(.rotate, selector: #selector(cropRotateTapped)))
-        }
+        for button in cropToolButtons() { cropToolsBar.addArrangedSubview(button) }
         cropToolsBar.translatesAutoresizingMaskIntoConstraints = false
         cropToolsBackground.translatesAutoresizingMaskIntoConstraints = false
         cropToolsBackground.isHidden = true
@@ -746,6 +949,20 @@ public final class MediaEditorViewController: UIViewController {
             // instead of bunching up at the leading edge.
             cropAspectBar.widthAnchor.constraint(greaterThanOrEqualTo: cropAspectScroll.frameLayoutGuide.widthAnchor),
         ])
+    }
+
+    /// The crop tool's flip and rotate presets the selected media offers.
+    private func cropToolButtons() -> [UIButton] {
+        let tools = configuration.tools(for: item.kind)
+        var buttons: [UIButton] = []
+        if tools.contains(.flip) {
+            buttons.append(makeToolButton(.flipHorizontal, selector: #selector(cropFlipHTapped)))
+            buttons.append(makeToolButton(.flipVertical, selector: #selector(cropFlipVTapped)))
+        }
+        if tools.contains(.rotate) {
+            buttons.append(makeToolButton(.rotate, selector: #selector(cropRotateTapped)))
+        }
+        return buttons
     }
 
     private func setupDrawChrome() {
@@ -1014,7 +1231,7 @@ public final class MediaEditorViewController: UIViewController {
     /// Undo/redo stay out of sight until there is something to undo or redo,
     /// and while a tool is open — it has its own Cancel.
     private func updateHistoryVisibility(animated: Bool) {
-        let show = mode == .normal && (history.canUndo || history.canRedo)
+        let show = mode == .normal && !isPassthrough && (history.canUndo || history.canRedo)
         let target: CGFloat = show ? 1 : 0
         guard animated else {
             historyContainer.layer.removeAllAnimations()
@@ -1042,21 +1259,31 @@ public final class MediaEditorViewController: UIViewController {
         toolbarProvider.updateToolbar(customToolbar, editor: self)
     }
 
-    /// Shows or hides the main-mode chrome along the bottom: whichever tool row
-    /// is in play, the floating Done button and the accessory. A custom row can
-    /// opt out of being hidden while a modal tool is open — though at the top it
-    /// lives in the top bar, which every tool swaps out for its own.
+    /// Shows or hides the main-mode chrome while a tool has the screen.
     private func setMainToolbarHidden(_ hidden: Bool) {
         if hidden { bottomAccessory?.endEditing(true) }     // a tool is taking over the screen
+        isToolOpen = hidden
+        refreshMainChrome()
+    }
+
+    /// Brings the main-mode chrome in line with the editor's state: hidden
+    /// while a tool is open — the tool row, the floating Done button, the strip
+    /// and the accessory — and the tool row also for media it has nothing to
+    /// offer, such as passthrough content. A custom row can opt out of hiding
+    /// while a tool is open — though at the top it lives in the top bar, which
+    /// every tool swaps out for its own.
+    private func refreshMainChrome() {
         updateHistoryVisibility(animated: false)
-        bottomAccessory?.isHidden = hidden
-        floatingDoneButton?.isHidden = hidden
+        bottomAccessory?.isHidden = isToolOpen
+        floatingDoneButton?.isHidden = isToolOpen
+        let nothingToOffer = isPassthrough || (customToolbar == nil && toolRow.arrangedSubviews.isEmpty)
         if let customToolbar {
-            guard toolbarProvider?.hidesToolbarInToolMode(customToolbar) ?? true else { return }
-            customToolbar.isHidden = hidden
+            let hidesForTool = isToolOpen && (toolbarProvider?.hidesToolbarInToolMode(customToolbar) ?? true)
+            customToolbar.isHidden = hidesForTool || isPassthrough
         } else {
-            toolRowContainer?.isHidden = hidden
+            toolRowContainer?.isHidden = isToolOpen || nothingToOffer
         }
+        applyStripVisibility(animated: false)
     }
 
     /// What the video controls stack above — the tool row when it sits at the
@@ -1362,26 +1589,20 @@ public final class MediaEditorViewController: UIViewController {
 
     // MARK: - Video
 
-    private func setupVideo(url: URL) {
-        let asset = AVURLAsset(url: url)
-        videoAsset = asset
+    /// Whether the session offers the filmstrip for its videos.
+    private var offersTrim: Bool { configuration.tools(for: .video).contains(.trim) }
+    /// The transport, filmstrip and readout have been added to the view.
+    private var hasVideoChrome = false
 
-        let playerItem = AVPlayerItem(asset: asset)
-        let player = AVPlayer(playerItem: playerItem)
-        player.actionAtItemEnd = .none
-        let layer = AVPlayerLayer(player: player)
-        // The layer is sized to the video's own aspect by `layoutVideoPreview`,
-        // and the container crops it, so the layer itself fills exactly.
-        layer.videoGravity = .resize
-        videoContainer.clipsToBounds = true
-        videoContainer.layer.addSublayer(layer)
-        imageView.addSubview(videoContainer)
-        self.player = player
-        self.playerLayer = layer
+    /// Adds the transport, filmstrip and time readout — once: a session reuses
+    /// them for every video it shows, and hides them for everything else.
+    private func installVideoChromeIfNeeded() {
+        guard !hasVideoChrome else { return }
+        hasVideoChrome = true
 
         // The filmstrip is a configurable tool, not fixed furniture: a host that
         // leaves `.trim` out gets playback and the other tools without it.
-        if showsTrimScrubber {
+        if offersTrim {
             trimScrubber.delegate = self
             trimScrubber.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview(trimScrubber)
@@ -1417,7 +1638,7 @@ public final class MediaEditorViewController: UIViewController {
         view.addSubview(timeLabel)
         NSLayoutConstraint.activate([
             timeLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            timeLabel.bottomAnchor.constraint(equalTo: showsTrimScrubber ? trimScrubber.topAnchor : bottomChromeTopAnchor,
+            timeLabel.bottomAnchor.constraint(equalTo: offersTrim ? trimScrubber.topAnchor : bottomChromeTopAnchor,
                                               constant: -8),
             timeLabel.heightAnchor.constraint(equalToConstant: 16),
         ])
@@ -1427,6 +1648,31 @@ public final class MediaEditorViewController: UIViewController {
             playbackTick()
             return true
         }
+        liftChromeAbovePreview()
+    }
+
+    /// Puts the video at `url` on the canvas: a player clipped to the recipe's
+    /// crop, a display link for the playhead, and the asset's duration, tracks
+    /// and size loaded in the background.
+    private func loadVideo(url: URL) {
+        installVideoChromeIfNeeded()
+        let asset = AVURLAsset(url: url)
+        videoAsset = asset
+
+        let playerItem = AVPlayerItem(asset: asset)
+        let player = AVPlayer(playerItem: playerItem)
+        player.actionAtItemEnd = .none
+        let layer = AVPlayerLayer(player: player)
+        // The layer is sized to the video's own aspect by `layoutVideoPreview`,
+        // and the container crops it, so the layer itself fills exactly.
+        layer.videoGravity = .resize
+        videoContainer.clipsToBounds = true
+        videoContainer.layer.addSublayer(layer)
+        imageView.addSubview(videoContainer)
+        self.player = player
+        self.playerLayer = layer
+        setPlaybackChromeHidden(isToolOpen)
+
         let link = CADisplayLink(target: displayLinkProxy,
                                  selector: #selector(DisplayLinkProxy.tick(_:)))
         // The tick only nudges a playhead and watches for the player stopping;
@@ -1436,24 +1682,53 @@ public final class MediaEditorViewController: UIViewController {
         link.add(to: .main, forMode: .common)
         displayLink = link
 
-        Task { @MainActor [weak self] in
-            guard let self else { return }
+        videoLoadTask = Task { @MainActor [weak self] in
             let duration = (try? await asset.load(.duration))?.seconds ?? 0
+            guard let self, !Task.isCancelled, videoAsset === asset else { return }
             videoDuration = duration
             videoTrimStart = recipe.trim?.start ?? 0
             videoTrimEnd = recipe.trim?.end ?? duration
             timeLabel.configure(duration: duration)
+            timeLabel.isHidden = isToolOpen
             if showsTrimScrubber {
                 trimScrubber.configure(asset: asset, duration: duration)
                 if let trim = recipe.trim { trimScrubber.setTrim(start: trim.start, end: trim.end) }
             }
-            hasAudioTrack = !((try? await asset.loadTracks(withMediaType: .audio)) ?? []).isEmpty
-            videoOrientedSize = await orientedSize(of: asset)
+            let hasAudio = !((try? await asset.loadTracks(withMediaType: .audio)) ?? []).isEmpty
+            let size = await orientedSize(of: asset)
+            guard !Task.isCancelled, videoAsset === asset else { return }
+            hasAudioTrack = hasAudio
+            videoOrientedSize = size
             syncVideoState()
             // Park on the first frame — unless the user already hit play while
             // the asset was still loading.
             if !isVideoPlaying { park(at: videoTrimStart) } else { refreshTimeReadout() }
         }
+    }
+
+    /// Takes the selected video off the canvas: stops and releases its player,
+    /// invalidates its display link, and hides the controls until the next one.
+    private func unloadVideo() {
+        videoLoadTask?.cancel()
+        videoLoadTask = nil
+        displayLink?.invalidate()
+        displayLink = nil
+        player?.pause()
+        if playPauseButton.isPlaying { playPauseButton.setPlaying(false, animated: false) }
+        playerLayer?.removeFromSuperlayer()
+        videoContainer.removeFromSuperview()
+        player = nil
+        playerLayer = nil
+        videoAsset = nil
+        videoDuration = nil
+        videoOrientedSize = .zero
+        hasAudioTrack = false
+        playbackPosition = 0
+        videoTrimStart = 0
+        videoTrimEnd = .greatestFiniteMagnitude
+        playPauseButton.isHidden = true
+        trimScrubber.isHidden = true
+        timeLabel.isHidden = true
     }
 
     /// Mirrors the recipe onto the live preview: mute state, the audio toggle,
@@ -1466,8 +1741,8 @@ public final class MediaEditorViewController: UIViewController {
             syncTransport(animated: false)
         }
         playPauseButton.isHidden = hidden
-        trimScrubber.isHidden = hidden
-        timeLabel.isHidden = hidden || !timeLabel.isConfigured
+        trimScrubber.isHidden = hidden || !showsTrimScrubber
+        timeLabel.isHidden = hidden || videoDuration == nil
     }
 
     private func syncVideoState() {
@@ -1523,7 +1798,10 @@ public final class MediaEditorViewController: UIViewController {
     /// Whether the player is playing, or actively trying to. The player is the
     /// single source of truth here — it also stops on its own, and the asset
     /// loads asynchronously, so a separate flag drifts out of step with it.
-    var isVideoPlaying: Bool { player?.timeControlStatus != .paused }
+    var isVideoPlaying: Bool {
+        guard let player else { return false }        // no video on the canvas
+        return player.timeControlStatus != .paused
+    }
 
     /// Whether the frame callback is currently idle. Exposed for tests, which
     /// assert the editor isn't waking every frame for a parked video.
@@ -1557,7 +1835,15 @@ public final class MediaEditorViewController: UIViewController {
     /// Mirrors `recipe.removeAudio` onto the toggle, and keeps it out of the
     /// toolbar entirely for a source that has no audio to remove.
     private func updateAudioButton() {
-        (audioButtonHost ?? audioButton).isHidden = !hasAudioTrack
+        // Hide whatever sits in the row: the circular backing, or the button
+        // itself. The button inside a backing must stay visible — a session
+        // may have hidden it before the row was rebuilt around a new backing.
+        if let host = audioButtonHost, host !== audioButton {
+            host.isHidden = !hasAudioTrack
+            audioButton.isHidden = false
+        } else {
+            audioButton.isHidden = !hasAudioTrack
+        }
         let muted = recipe.removeAudio
         // The "on" state gets its own glyph; a host overriding the symbol for
         // `.toggleAudio` keeps control of the "off" one.
@@ -1682,57 +1968,6 @@ public final class MediaEditorViewController: UIViewController {
         player?.pause()
         syncTransport(animated: false)
         exportTask?.cancel()
-    }
-
-    // MARK: - Video export
-
-    private func exportVideo() {
-        guard let asset = videoAsset else { onFinish?(.cancelled); return }
-        // Don't leave the preview running behind the export panel.
-        player?.pause()
-        syncTransport(animated: false)
-        let output = FileManager.default.temporaryDirectory
-            .appendingPathComponent("MediaEditor-\(UUID().uuidString).mp4")
-        let hud = ExportProgressView(appearance: appearance)
-        hud.translatesAutoresizingMaskIntoConstraints = false
-        hud.onCancel = { [weak self] in self?.exportTask?.cancel() }
-        view.addSubview(hud)
-        NSLayoutConstraint.activate([
-            hud.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            hud.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            hud.topAnchor.constraint(equalTo: view.topAnchor),
-            hud.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-        ])
-
-        exportTask = Task { @MainActor in
-            defer { hud.removeFromSuperview() }
-            do {
-                try await composer.export(
-                    asset: asset, recipe: recipe, to: output,
-                    preset: configuration.videoExportPreset,
-                    maximumDimension: configuration.maximumExportDimension,
-                    onProgress: { progress in hud.setProgress(progress) },
-                    overlayImage: { [recipe = self.recipe, images = self.overlayImages,
-                                     artwork = self.videoArtworkRenderer] size in
-                        // Rendered at the output resolution, so text stays crisp.
-                        artwork.render(drawing: recipe.drawing, overlays: recipe.overlays,
-                                       images: images, size: size)
-                    })
-                teardownVideo()
-                // Ownership passes to the host here, and only here.
-                onFinish?(.saved(output: .video(output), recipe: recipe))
-            } catch is CancellationError {
-                // Cancelled exports leave a partial file nobody will ever read.
-                try? FileManager.default.removeItem(at: output)
-                // Stay in the editor; the user cancelled.
-            } catch {
-                try? FileManager.default.removeItem(at: output)
-                let alert = UIAlertController(title: L10n.exportFailedTitle,
-                                              message: error.localizedDescription, preferredStyle: .alert)
-                alert.addAction(UIAlertAction(title: L10n.ok, style: .default))
-                present(alert, animated: true)
-            }
-        }
     }
 
     // MARK: - Draw mode
@@ -1910,13 +2145,20 @@ public final class MediaEditorViewController: UIViewController {
 
     // MARK: - Overlays (stickers)
 
+    /// Stickers need media on the canvas: a decoded photo or a video.
+    private var canAddOverlays: Bool {
+        !isPassthrough && (item.kind == .video || sourceCGImage != nil)
+    }
+
     private func addText() {
+        guard canAddOverlays else { return }
         presentTextEditor(seed: TextStyle(string: "")) { [weak self] style in
             self?.insertOverlay(content: .text(style), image: nil)
         }
     }
 
     private func addPhoto() {
+        guard canAddOverlays else { return }
         var config = PHPickerConfiguration()
         config.filter = .images
         config.selectionLimit = 1
@@ -2035,7 +2277,13 @@ public final class MediaEditorViewController: UIViewController {
     /// collapses them into one "+" menu, but a custom row is free to surface
     /// them however it likes.
     public var toolbarActions: [EditorAction] {
-        let tools = configuration.tools(for: item.kind)
+        guard !isPassthrough else { return [] }
+        return actions(for: item.kind)
+    }
+
+    /// The tool-row actions `configuration` offers for `kind`.
+    private func actions(for kind: MediaKind) -> [EditorAction] {
+        let tools = configuration.tools(for: kind)
         var actions: [EditorAction] = []
         if tools.contains(.crop) {
             actions.append(.crop)
@@ -2055,6 +2303,8 @@ public final class MediaEditorViewController: UIViewController {
     /// action the configuration doesn't offer — it simply does nothing when the
     /// underlying tool is unavailable.
     public func perform(_ action: EditorAction) {
+        // Passthrough content has nothing to edit.
+        if isPassthrough, ![.undo, .redo, .cancel, .done].contains(action) { return }
         switch action {
         case .crop:           enterCropMode()
         case .rotate:         rotateTapped()
@@ -2075,6 +2325,7 @@ public final class MediaEditorViewController: UIViewController {
     /// Whether `action` can be run right now — undo/redo depend on history, the
     /// audio toggle on the source actually having a track.
     public func isEnabled(_ action: EditorAction) -> Bool {
+        if isPassthrough, ![.cancel, .done].contains(action) { return false }
         switch action {
         case .undo:        return history.canUndo
         case .redo:        return history.canRedo
@@ -2096,6 +2347,19 @@ public final class MediaEditorViewController: UIViewController {
         default:           return false
         }
     }
+
+    /// Whether a tool — crop, drawing or filters — has the screen.
+    public var isToolActive: Bool { mode != .normal }
+
+    // Internal so tests can check what the session holds in memory.
+    /// The selected photo is decoded at full size.
+    var hasFullSizeDecode: Bool { sourceCGImage != nil }
+    /// A video player is loaded.
+    var hasVideoPlayer: Bool { player != nil }
+    /// The thumbnail strip, for a session.
+    var strip: ThumbnailStripView? { isSingleItemEditor ? nil : thumbnailStrip }
+    /// An export is running.
+    var isExporting: Bool { exportTask != nil }
 
     public func undo() {
         if let state = history.undo() {
@@ -2126,43 +2390,406 @@ public final class MediaEditorViewController: UIViewController {
         overlayContainer.reload(overlays: recipe.overlays, images: overlayImages)
     }
 
+    // MARK: - Session
+
+    /// Points the editor at the selected item's media: decodes a photo held in
+    /// memory, notes a video's URL, or marks passthrough content. The views
+    /// follow in `loadSelectedMediaViews()` once there is a view to put them in.
+    private func prepareSelectedMedia() {
+        let selected = items[selectedIndex]
+        isPassthrough = false
+        sourceImage = nil
+        sourceCGImage = nil
+        previewSourceCGImage = nil
+        previewSourceCap = 0
+        switch selected.source {
+        case let .photo(image):
+            let normalized = image.normalizedUp()
+            sourceImage = normalized
+            sourceCGImage = normalized.cgImage
+            item = .photo(image)
+        case .photoFile:
+            // Decoded off the main actor when shown; nothing to edit until then.
+            item = .photo(UIImage())
+        case let .video(url):
+            item = .video(url)
+        case .passthrough:
+            item = .photo(UIImage())
+            isPassthrough = true
+        }
+        // Restore image-overlay content from a resumed recipe.
+        for overlay in selected.recipe.overlays {
+            if case let .image(ref) = overlay.content, overlayImages[ref.id] == nil,
+               let data = ref.data, let image = UIImage(data: data) {
+                overlayImages[ref.id] = image
+            }
+        }
+    }
+
+    /// Puts the selected media on the canvas.
+    private func loadSelectedMediaViews() {
+        switch items[selectedIndex].source {
+        case .photo:
+            break                                    // rendered by the layout pass
+        case let .photoFile(url):
+            loadPhotoFile(url: url)
+        case let .video(url):
+            loadVideo(url: url)
+        case let .passthrough(_, preview):
+            let content = preview()
+            content.translatesAutoresizingMaskIntoConstraints = false
+            passthroughHost.addSubview(content)
+            NSLayoutConstraint.activate([
+                content.leadingAnchor.constraint(equalTo: passthroughHost.leadingAnchor),
+                content.trailingAnchor.constraint(equalTo: passthroughHost.trailingAnchor),
+                content.topAnchor.constraint(equalTo: passthroughHost.topAnchor),
+                content.bottomAnchor.constraint(equalTo: passthroughHost.bottomAnchor),
+            ])
+            passthroughView = content
+            passthroughHost.isHidden = false
+            overlayContainer.isHidden = true
+        }
+    }
+
+    /// Decodes a photo file at full size off the main actor. Until it lands,
+    /// the strip's thumbnail stands in, scaled up, so the switch feels instant —
+    /// it already shows the edits, so the live sticker layer waits for the
+    /// real image.
+    private func loadPhotoFile(url: URL) {
+        let id = selectedItemID
+        imageView.image = thumbnailStrip.thumbnail(for: id)
+        overlayContainer.isHidden = true
+        photoLoadTask = Task { @MainActor [weak self] in
+            let decoded = await Task.detached(priority: .userInitiated) {
+                EditRenderer.decodeUpright(url: url, maxPixelSize: nil)
+            }.value
+            guard let self, !Task.isCancelled, selectedItemID == id, let decoded else { return }
+            let image = UIImage(cgImage: decoded)
+            sourceImage = image
+            sourceCGImage = decoded
+            item = .photo(image)
+            previewSourceCap = 0
+            overlayContainer.isHidden = false
+            view.setNeedsLayout()
+            view.layoutIfNeeded()
+            refreshPreviewSourceIfNeeded()
+            renderPreview()
+            reloadOverlaysFromRecipe()
+            notifyToolbarStateChanged()
+        }
+    }
+
+    /// Takes the selected item's media off the canvas and lets go of its
+    /// full-size decode.
+    private func unloadSelectedMedia() {
+        photoLoadTask?.cancel()
+        photoLoadTask = nil
+        if player != nil || videoAsset != nil { unloadVideo() }
+        passthroughView?.removeFromSuperview()
+        passthroughView = nil
+        passthroughHost.isHidden = true
+        overlayContainer.deselect()
+        overlayContainer.isHidden = false
+        imageView.image = nil
+    }
+
+    /// Whether the selected item's media is a photo, a video, or not editable.
+    private var selectedKind: MediaKind? { isPassthrough ? nil : item.kind }
+
+    /// Shows item `id` on the canvas. Its edits and undo history are as the
+    /// user left them; whatever was selected keeps its own. An open tool is
+    /// cancelled first.
+    public func select(_ id: UUID) {
+        guard id != selectedItemID, items.contains(where: { $0.id == id }) else { return }
+        switchSelection(to: id)
+        onSelectionChange?(id)
+    }
+
+    private func switchSelection(to id: UUID) {
+        switch mode {
+        case .crop:   cancelCropTapped()
+        case .draw:   cancelDrawTapped()
+        case .filter: cancelFilterTapped()
+        case .normal: break
+        }
+        histories[selectedItemID] = history
+        if isViewLoaded { unloadSelectedMedia() }
+        let previousKind = selectedKind
+
+        selectedItemID = id
+        let selected = items[selectedIndex]
+        isLoadingSelection = true
+        history = histories.removeValue(forKey: id)
+            ?? EditHistory(initial: selected.recipe, limit: configuration.historyLimit)
+        prepareSelectedMedia()
+        recipe = history.current
+        isLoadingSelection = false
+
+        guard isViewLoaded else { return }
+        if selectedKind != previousKind { rebuildToolRows() }
+        loadSelectedMediaViews()
+        reloadOverlaysFromRecipe()
+        updateDrawingLayer()
+        updateHistoryButtons()
+        refreshMainChrome()
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        renderPreview()
+        updateStrip()
+    }
+
+    /// Removes item `id` from the session. Removing the selected item selects
+    /// its neighbour; removing the last one ends the session with `.cancelled`.
+    public func remove(_ id: UUID) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        guard items.count > 1 else {
+            items.removeAll()
+            histories.removeAll()
+            onItemsChange?(items)
+            endSession(.cancelled)
+            return
+        }
+        let removingSelected = id == selectedItemID
+        if removingSelected {
+            switchSelection(to: items[index + 1 < items.count ? index + 1 : index - 1].id)
+        }
+        items.remove(at: index)
+        histories[id] = nil
+        thumbnailRecipes[id] = nil
+        thumbnailQueue.removeAll { $0 == id }
+        if isViewLoaded { updateStrip() }
+        onItemsChange?(items)
+        if removingSelected { onSelectionChange?(selectedItemID) }
+    }
+
+    /// Adds items to the session — at `index`, or at the end — and selects the
+    /// first of them. Items already in the session are skipped.
+    public func insert(_ newItems: [MediaEditorItem], at index: Int? = nil) {
+        let fresh = newItems.filter { new in !items.contains { $0.id == new.id } }
+        guard let first = fresh.first else { return }
+        let position = min(max(0, index ?? items.count), items.count)
+        items.insert(contentsOf: fresh, at: position)
+        if isViewLoaded { updateStrip() }
+        onItemsChange?(items)
+        select(first.id)
+    }
+
+    /// Moves an item within the strip.
+    private func moveItem(from source: Int, to destination: Int) {
+        guard items.indices.contains(source), items.indices.contains(destination), source != destination else { return }
+        let moved = items.remove(at: source)
+        items.insert(moved, at: destination)
+        if isViewLoaded { updateStrip() }
+        onItemsChange?(items)
+    }
+
+    /// Rebuilds the tool rows for the selected media — photos and videos offer
+    /// different tools.
+    private func rebuildToolRows() {
+        if customToolbar == nil {
+            toolRow.arrangedSubviews.forEach { $0.removeFromSuperview() }
+            audioButtonHost = nil
+            for button in toolbarButtons() { toolRow.addArrangedSubview(button) }
+        }
+        cropToolsBar.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        for button in cropToolButtons() { cropToolsBar.addArrangedSubview(button) }
+        notifyToolbarStateChanged()
+    }
+
+    /// The actions a custom row is offered in a session: those of every kind of
+    /// media in it, so the row can serve whichever item is selected.
+    private var sessionToolbarActions: [EditorAction] {
+        let kinds = Set(items.compactMap(\.source.kind))
+        let all = kinds.flatMap { actions(for: $0) }
+        return EditorAction.allCases.filter { all.contains($0) }
+    }
+
+    // MARK: - Strip
+
+    /// Adds the thumbnail strip, directly above the accessory, for a session.
+    private func setupStrip() {
+        guard !isSingleItemEditor else { return }
+        thumbnailStrip.delegate = self
+        thumbnailStrip.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(thumbnailStrip)
+        NSLayoutConstraint.activate([
+            thumbnailStrip.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            thumbnailStrip.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            thumbnailStrip.heightAnchor.constraint(equalToConstant: ThumbnailStripView.height(for: appearance)),
+            // Rides on the accessory, so a strip left up with the keyboard
+            // stays attached to the bar.
+            thumbnailStrip.bottomAnchor.constraint(equalTo: bottomAccessory?.topAnchor ?? accessoryGuide.topAnchor),
+        ])
+        updateStrip()
+    }
+
+    /// Refreshes the strip's cells and whether it's on screen, and queues
+    /// thumbnails it doesn't have yet.
+    private func updateStrip() {
+        guard !isSingleItemEditor, isViewLoaded, !items.isEmpty else { return }
+        stripIsInUse = items.count >= 2 || onAddItems != nil
+        thumbnailStrip.showsAddCell = onAddItems != nil
+        thumbnailStrip.update(items: items, selectedID: selectedItemID)
+        stripHeightConstraint?.constant = stripIsInUse ? ThumbnailStripView.height(for: appearance) : 0
+        applyStripVisibility(animated: view.window != nil)
+        for item in items where thumbnailRecipes[item.id] != item.recipe { enqueueThumbnail(item.id) }
+    }
+
+    /// Fades the strip in or out: shown while it's in use, no tool is open, and
+    /// — unless the appearance says otherwise — the keyboard is down. Its space
+    /// stays reserved either way, so the media doesn't move.
+    private func applyStripVisibility(animated: Bool) {
+        guard !isSingleItemEditor, isViewLoaded else { return }
+        let visible = stripIsInUse && !isToolOpen
+            && !(isKeyboardUp && appearance.hidesThumbnailStripWithKeyboard)
+        thumbnailStrip.isUserInteractionEnabled = visible
+        if visible { thumbnailStrip.isHidden = false }
+        let changes = { [weak self] in
+            guard let self else { return }
+            thumbnailStrip.alpha = visible ? 1 : 0
+            view.layoutIfNeeded()
+        }
+        let completion: (Bool) -> Void = { [weak self] _ in
+            guard let self, thumbnailStrip.alpha == 0 else { return }
+            thumbnailStrip.isHidden = true
+        }
+        if animated {
+            UIView.animate(withDuration: 0.2, animations: changes, completion: completion)
+        } else {
+            changes()
+            completion(true)
+        }
+    }
+
+    /// Re-renders an item's thumbnail once its edits settle.
+    private func scheduleThumbnailRefresh(for id: UUID) {
+        guard !isSingleItemEditor else { return }
+        thumbnailDebounce?.cancel()
+        thumbnailDebounce = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            self?.enqueueThumbnail(id)
+        }
+    }
+
+    private func enqueueThumbnail(_ id: UUID) {
+        guard !isSingleItemEditor else { return }
+        if !thumbnailQueue.contains(id) { thumbnailQueue.append(id) }
+        pumpThumbnails()
+    }
+
+    /// Renders queued thumbnails one at a time, so a large session never holds
+    /// more than one decode at once.
+    private func pumpThumbnails() {
+        guard thumbnailTask == nil, !thumbnailQueue.isEmpty else { return }
+        let id = thumbnailQueue.removeFirst()
+        guard let item = items.first(where: { $0.id == id }) else { pumpThumbnails(); return }
+        let maxPixelSize = appearance.thumbnailSize * max(1, traitCollection.displayScale)
+        let images = overlayImages.merging(editRenderer.stickerImages(for: item.recipe)) { cached, _ in cached }
+        thumbnailTask = Task { @MainActor [weak self] in
+            guard let renderer = self?.editRenderer else { return }
+            let image = await renderer.thumbnail(for: item, maxPixelSize: maxPixelSize, images: images)
+            var duration: Double?
+            if case let .video(url) = item.source {
+                let total = (try? await AVURLAsset(url: url).load(.duration))?.seconds
+                duration = item.recipe.trim?.duration ?? total
+            }
+            guard let self, !Task.isCancelled else { return }
+            thumbnailTask = nil
+            if items.contains(where: { $0.id == id }) {
+                thumbnailRecipes[id] = item.recipe
+                thumbnailStrip.setThumbnail(image, duration: duration, for: id)
+                // Edited again while this one rendered.
+                if items.first(where: { $0.id == id })?.recipe != item.recipe { enqueueThumbnail(id) }
+            }
+            pumpThumbnails()
+        }
+    }
+
+    /// A swipe on empty canvas pages to the next or previous item.
+    private func swipe(_ direction: UISwipeGestureRecognizer.Direction) {
+        guard mode == .normal, items.count > 1 else { return }
+        let index = selectedIndex
+        let target = direction == .left ? index + 1 : index - 1
+        guard items.indices.contains(target) else { return }
+        select(items[target].id)
+    }
+
+    @objc private func passthroughSwiped(_ gesture: UISwipeGestureRecognizer) {
+        swipe(gesture.direction)
+    }
+
+    /// Stops everything the editor runs in the background: pauses playback,
+    /// invalidates the display link, cancels an in-flight export (its partial
+    /// file is removed) and puts away the PencilKit tool picker.
+    ///
+    /// Call it when the editor leaves the screen for good — `MediaEditorView`
+    /// does so when SwiftUI removes it. Ending a session does it too.
+    public func tearDown() {
+        exportTask?.cancel()
+        thumbnailTask?.cancel()
+        thumbnailTask = nil
+        thumbnailDebounce?.cancel()
+        photoLoadTask?.cancel()
+        videoLoadTask?.cancel()
+        teardownVideo()
+        if mode == .draw {
+            toolPicker.setVisible(false, forFirstResponder: canvasView)
+            toolPicker.removeObserver(canvasView)
+        }
+    }
+
+    /// Ends the session, reporting through whichever handler the editor was
+    /// created with.
+    private func endSession(_ result: MediaEditorSessionResult) {
+        tearDown()
+        if isSingleItemEditor {
+            switch result {
+            case .cancelled:
+                onFinish?(.cancelled)
+            case let .saved(results):
+                guard let first = results.first, let output = first.output else { onFinish?(.cancelled); return }
+                onFinish?(.saved(output: output, recipe: first.item.recipe))
+            }
+        } else {
+            onSessionFinish?(result)
+        }
+    }
+
     // MARK: - Session end
 
     /// Cancels the session without saving.
     public func cancel() {
-        teardownVideo()
-        onFinish?(.cancelled)
+        endSession(.cancelled)
     }
 
-    /// Renders the current recipe and finishes with the result.
+    /// Confirms the edits.
     ///
-    /// Photos render synchronously through `PhotoRenderer`. Videos export
-    /// asynchronously through `VideoComposer` behind a progress panel, with the
-    /// drawing and overlays burned in; `onFinish` fires once the file is ready.
-    /// Stacks the edits onto the rendered photo as on screen — the stickers
-    /// under the strokes, the strokes, then the stickers over them — in a
-    /// single full-resolution pass, so a large photo needs one output bitmap
-    /// and one for the strokes rather than one per layer.
-    private func composite(base: UIImage) -> UIImage {
-        guard !recipe.overlays.isEmpty || recipe.drawing != nil else { return base }
-        let canvas = base.size
-        let pixels = CGSize(width: canvas.width * base.scale, height: canvas.height * base.scale)
-        let strokes = recipe.drawing.flatMap { drawingCompositor.strokeImage(for: $0, outputSize: pixels) }
-        let layers = recipe.overlayLayers
-
-        let format = UIGraphicsImageRendererFormat.preferred()
-        format.scale = base.scale
-        format.opaque = false
-        let bounds = CGRect(origin: .zero, size: canvas)
-        return UIGraphicsImageRenderer(size: canvas, format: format).image { context in
-            base.draw(in: bounds)
-            overlayCompositor.draw(layers.belowDrawing, in: context.cgContext, canvas: canvas, images: overlayImages)
-            strokes?.draw(in: bounds)
-            overlayCompositor.draw(layers.aboveDrawing, in: context.cgContext, canvas: canvas, images: overlayImages)
+    /// A single-item editor renders and reports through `onFinish`: photos
+    /// synchronously, videos exported behind a progress panel with the drawing
+    /// and overlays burned in. A multi-item session follows
+    /// `EditorConfiguration.finishMode` — rendering every edited item behind
+    /// the panel, or handing back the recipes straight away. Either way the
+    /// output is exactly what ``EditRenderer`` produces.
+    ///
+    /// Cancelling the panel returns to the editor. If a render fails, an alert
+    /// says so, anything already rendered for the session is deleted, and the
+    /// user stays in the editor to try again.
+    public func finish() {
+        guard exportTask == nil else { return }              // already rendering
+        if isSingleItemEditor {
+            finishSingleItem()
+            return
+        }
+        switch configuration.finishMode {
+        case .recipesOnly:
+            endSession(.saved(items.map { MediaEditorItemResult(item: $0, output: nil) }))
+        case .render:
+            renderSession()
         }
     }
 
-    public func finish() {
+    private func finishSingleItem() {
         switch item {
         case .photo:
             guard let sourceCGImage,
@@ -2170,11 +2797,104 @@ public final class MediaEditorViewController: UIViewController {
                 onFinish?(.cancelled)
                 return
             }
-            let output = composite(base: UIImage(cgImage: rendered))
+            let output = editRenderer.composite(base: UIImage(cgImage: rendered), recipe: recipe, images: overlayImages)
             onFinish?(.saved(output: .photo(output), recipe: recipe))
         case .video:
-            exportVideo()
+            renderSession()
         }
+    }
+
+    /// Renders every item that has edits, one after another, behind the
+    /// progress panel — never in parallel, which would multiply peak memory.
+    private func renderSession() {
+        // Don't leave the preview running behind the export panel.
+        player?.pause()
+        syncTransport(animated: false)
+        let snapshot = items
+        let pending = snapshot.filter { item in
+            // A single-item editor always renders; a session skips what has
+            // nothing to render.
+            item.source.isEditable && (isSingleItemEditor || !item.recipe.isIdentity)
+        }
+        guard !pending.isEmpty else {
+            endSession(.saved(snapshot.map { MediaEditorItemResult(item: $0, output: nil) }))
+            return
+        }
+
+        let hud = ExportProgressView(appearance: appearance)
+        hud.translatesAutoresizingMaskIntoConstraints = false
+        hud.onCancel = { [weak self] in self?.exportTask?.cancel() }
+        view.addSubview(hud)
+        NSLayoutConstraint.activate([
+            hud.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            hud.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            hud.topAnchor.constraint(equalTo: view.topAnchor),
+            hud.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        ])
+
+        exportTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var outputs: [UUID: EditorOutput] = [:]
+            do {
+                for (step, item) in pending.enumerated() {
+                    try Task.checkCancellation()
+                    let report: (Float) -> Void = { progress in
+                        if pending.count == 1 {
+                            hud.setProgress(progress)
+                        } else {
+                            hud.setProgress((Float(step) + progress) / Float(pending.count),
+                                            item: step + 1, of: pending.count)
+                        }
+                    }
+                    report(0)
+                    let images = overlayImages.merging(editRenderer.stickerImages(for: item.recipe)) { cached, _ in cached }
+                    if item.id == selectedItemID, item.source.kind == .photo, let sourceCGImage {
+                        // Already decoded for editing — don't decode it twice.
+                        outputs[item.id] = .photo(try await editRenderer.renderPhoto(
+                            upright: sourceCGImage, recipe: item.recipe, images: images))
+                    } else {
+                        outputs[item.id] = try await editRenderer.render(
+                            source: item.source, recipe: item.recipe, images: images, onProgress: report)
+                    }
+                    report(1)
+                }
+                hud.removeFromSuperview()
+                exportTask = nil
+                // Ownership of video files passes to the host here, and only here.
+                endSession(.saved(snapshot.map { MediaEditorItemResult(item: $0, output: outputs[$0.id]) }))
+            } catch {
+                hud.removeFromSuperview()
+                exportTask = nil
+                // Whatever was rendered before the failure is thrown away; the
+                // next attempt renders everything again.
+                for case let .video(url) in outputs.values { try? FileManager.default.removeItem(at: url) }
+                guard !(error is CancellationError) else { return }      // stay; the user cancelled
+                let alert = UIAlertController(title: L10n.exportFailedTitle,
+                                              message: error.localizedDescription, preferredStyle: .alert)
+                alert.addAction(UIAlertAction(title: L10n.ok, style: .default))
+                present(alert, animated: true)
+            }
+        }
+    }
+}
+
+// MARK: - Thumbnail strip delegate
+
+extension MediaEditorViewController: ThumbnailStripDelegate {
+    func thumbnailStrip(_ strip: ThumbnailStripView, didSelect id: UUID) {
+        select(id)
+    }
+
+    func thumbnailStrip(_ strip: ThumbnailStripView, didRemove id: UUID) {
+        remove(id)
+    }
+
+    func thumbnailStrip(_ strip: ThumbnailStripView, didMoveItemFrom source: Int, to destination: Int) {
+        moveItem(from: source, to: destination)
+    }
+
+    func thumbnailStripDidTapAdd(_ strip: ThumbnailStripView) {
+        onAddItems?()
     }
 }
 
