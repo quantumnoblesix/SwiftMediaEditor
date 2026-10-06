@@ -3,7 +3,7 @@
 A native, dependency-free media editor for iOS — edit **photos** and **videos**
 with the same non-destructive engine, usable from both **UIKit** and **SwiftUI**.
 
-> Current release: **1.3.0**. See the [changelog](CHANGELOG.md) for what's included.
+> Current release: **1.3.1**. See the [changelog](CHANGELOG.md) for what's included.
 
 ## Features
 
@@ -263,7 +263,7 @@ see `BrandedToolbar.swift`.
 Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/quantumnoblesix/SwiftMediaEditor.git", from: "1.3.0")
+.package(url: "https://github.com/quantumnoblesix/SwiftMediaEditor.git", from: "1.3.1")
 ```
 
 then add the product to your target — SwiftPM names the package after the
