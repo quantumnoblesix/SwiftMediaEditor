@@ -4,6 +4,29 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-10-06
+
+### Fixed
+
+- Pinch to zoom no longer lags. Every frame of a pinch used to re-render the
+  photo on the main thread — about 66 ms a frame for a 12 MP photo in the
+  Simulator. The picture is now only scaled while the fingers move, and the
+  sharp zoomed-in render follows from the background once the zoom settles,
+  and only when it crosses 1×, 2× or 4×. Zooming back out is instant.
+- An edit while zoomed in — an undo, say — no longer stalls on a render at the
+  zoomed size: it shows at once at screen size and sharpens from the
+  background. Zoomed in, the editor no longer keeps a zoomed-size copy of the
+  source, about 60 MB less for a 48 MP photo at 4×.
+- A drag no longer has to wait for the previous page turn to finish. One that
+  catches a turn still sliding home lands it on the spot and carries on from
+  where the pages are on screen, reusing them, so a quick swipe there and back
+  works. Right after a turn lands, a new drag starts at once instead of under
+  the fading one.
+- A page turn cut short — by the app going to the background mid-slide, say —
+  no longer leaves its pages frozen over the canvas.
+- Catching a page turn as it springs back to a playing video no longer leaves
+  the video paused.
+
 ## [1.3.0] - 2026-10-05
 
 ### Added
@@ -253,6 +276,7 @@ The first public release.
 - On native macOS only `MediaEditorCore` is available; the editor UI runs on the
   Mac through Mac Catalyst.
 
+[1.3.1]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.3.0...1.3.1
 [1.3.0]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.2.0...1.3.0
 [1.2.0]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.1.0...1.2.0
 [1.1.0]: https://github.com/quantumnoblesix/SwiftMediaEditor/compare/1.0.0...1.1.0
