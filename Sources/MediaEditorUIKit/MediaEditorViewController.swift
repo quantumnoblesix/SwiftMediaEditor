@@ -1138,15 +1138,23 @@ public final class MediaEditorViewController: UIViewController {
     /// back to the full source until the view has been laid out.
     private var previewSource: CGImage? { previewSourceCGImage ?? sourceCGImage }
 
+    /// The pixel size of the source the preview re-renders from — for tests,
+    /// which check it stays screen-sized while zoomed.
+    var previewSourcePixelSize: CGSize? {
+        previewSource.map { CGSize(width: $0.width, height: $0.height) }
+    }
+
     /// Rebuilds `previewSourceCGImage` when the preview's pixel size changes.
     /// Returns whether it changed, so the caller can re-render.
     @discardableResult
     private func refreshPreviewSourceIfNeeded() -> Bool {
         guard let sourceCGImage, isViewLoaded else { return false }
         let scale = view.window?.screen.scale ?? UIScreen.main.scale
-        // Zoomed in, the preview shows more pixels per point — up to the
-        // source's own, which the check below caps it at.
-        let cap = (max(imageView.bounds.width, imageView.bounds.height) * scale * zoomScale).rounded()
+        // Screen-sized whatever the zoom: a zoomed-in picture is rendered from
+        // the full source in the background (`sharpenPreview`), and nothing
+        // here follows the zoom — a pinch lays the views out every frame, and
+        // re-rendering on each would stall it.
+        let cap = (max(imageView.bounds.width, imageView.bounds.height) * scale).rounded()
         guard cap > 0, abs(cap - previewSourceCap) > 1 else { return false }
         previewSourceCap = cap
 
@@ -1159,6 +1167,10 @@ public final class MediaEditorViewController: UIViewController {
         return true
     }
 
+    /// Renders the preview at screen size, at once. Zoomed in, that's a
+    /// little soft for a moment: the sharp picture follows from the
+    /// background, so an edit — an undo, say — never stalls on a render at the
+    /// zoomed size.
     private func renderPreview() {
         guard mode == .normal else { return }        // crop/draw modes manage their own image
         guard let source = previewSource, isViewLoaded else { return }
@@ -1166,6 +1178,8 @@ public final class MediaEditorViewController: UIViewController {
         // The drawing and overlays are live layers on top, not baked in.
         imageView.image = UIImage(cgImage: rendered)
         syncOverlayCanvas()
+        previewZoom = 1
+        if isZoomed { sharpenPreview() }
     }
 
     /// Where the stickers and the drawing are laid out, in the image view's
@@ -2759,6 +2773,17 @@ public final class MediaEditorViewController: UIViewController {
     /// Whether the media is zoomed in.
     var isZoomed: Bool { zoomScale > 1.01 }
 
+    /// The magnification the picture on screen was rendered for: 1×, 2× or
+    /// 4×. It moves only once a zoom has settled past one of those steps and
+    /// the sharper render has landed — never during a pinch, nor for small
+    /// changes.
+    private var previewZoom: CGFloat = 1
+    /// Renders the preview for a new zoom step off the main actor.
+    private var zoomRenderTask: Task<Void, Never>?
+    /// The unzoomed preview and the recipe it shows, kept while zoomed so
+    /// zooming back out is instant.
+    private var unzoomedPreview: (recipe: EditRecipe, image: UIImage)?
+
     /// Photos and videos zoom in the main mode. Passthrough content is the
     /// host's own view, with its own gestures.
     private var canZoom: Bool { mode == .normal && !isPassthrough && paging == nil }
@@ -2870,7 +2895,56 @@ public final class MediaEditorViewController: UIViewController {
         } else {
             changes()
         }
-        if refreshPreviewSourceIfNeeded() { renderPreview() }
+        sharpenPreview()
+    }
+
+    /// Brings a photo's preview to the zoom step the media settled on. Going
+    /// in, the current picture stays up — scaled — while the sharper one
+    /// renders in the background; coming back out, the unzoomed one is put
+    /// straight back.
+    private func sharpenPreview() {
+        let target: CGFloat = zoomScale <= 1 ? 1 : zoomScale <= 2 ? 2 : Self.maximumZoom
+        zoomRenderTask?.cancel()
+        zoomRenderTask = nil
+        guard target != previewZoom else {
+            if target == 1 { unzoomedPreview = nil }      // a zoom-in that never landed
+            return
+        }
+        if target == 1 {
+            previewZoom = 1
+            if let cached = unzoomedPreview, !recipe.rendersDifferently(from: cached.recipe) {
+                imageView.image = cached.image
+                syncOverlayCanvas()
+            } else {
+                renderPreview()
+            }
+            unzoomedPreview = nil
+            return
+        }
+        guard mode == .normal, let source = sourceCGImage else { return }      // photos only
+        if previewZoom == 1, let current = imageView.image { unzoomedPreview = (recipe, current) }
+        let scale = view.window?.screen.scale ?? UIScreen.main.scale
+        let cap = (max(imageView.bounds.width, imageView.bounds.height) * scale * target).rounded()
+        let recipe = recipe
+        let renderer = renderer
+        zoomRenderTask = Task { @MainActor [weak self] in
+            // Only the rendered picture is kept: an edit re-renders from the
+            // screen-sized source, so the zoomed-size one is let go at once.
+            let rendered = await Task.detached(priority: .userInitiated) { () -> CGImage? in
+                let base = CGFloat(max(source.width, source.height)) <= cap
+                    ? source
+                    : Self.downscaledOffscreen(UIImage(cgImage: source), maxDimension: cap).cgImage ?? source
+                return renderer.renderGeometry(cgImage: base, recipe: recipe)
+            }.value
+            // Dropped if the user moved on: another item, a tool, or an edit
+            // that changes the picture.
+            guard let self, !Task.isCancelled, let rendered, mode == .normal, sourceCGImage === source,
+                  !self.recipe.rendersDifferently(from: recipe) else { return }
+            zoomRenderTask = nil
+            previewZoom = target
+            imageView.image = UIImage(cgImage: rendered)
+            syncOverlayCanvas()
+        }
     }
 
     /// The offset nearest `offset` that keeps the zoomed media covering the
@@ -2912,14 +2986,35 @@ public final class MediaEditorViewController: UIViewController {
         let track: UIView
         /// The pages on the track, keyed by their offset from the selected item.
         let pages: [Int: UUID]
+        /// The view showing each page, keyed the same way, with the selected
+        /// item's still at `0` — handed on to a drag that catches the turn.
+        let pageViews: [Int: UIView]
         let pageWidth: CGFloat
+        /// Where the track started: a drag that caught a turn mid-flight
+        /// carries on from where the pages were, not from the middle.
+        let base: CGFloat
         /// Whether the video was playing when the turn began, to resume it if
         /// the turn springs back.
         let resumesPlayback: Bool
         /// The finger is still on it; once it lets go — or for a strip tap,
-        /// from the start — the track is animating and a new drag leaves it be.
+        /// from the start — the track is animating.
         var isTracking: Bool
+        /// The page it's settling on, once the finger has let go.
+        var landing: Int?
     }
+
+    /// A turn whose selection has already happened, still on screen while it
+    /// slides home (a strip tap's) or fades off the canvas. A new drag takes
+    /// its pages over rather than waiting for it.
+    private struct LandedTurn {
+        let cover: UIView
+        let track: UIView
+        let pageViews: [Int: UIView]
+        let pageWidth: CGFloat
+        /// The page it lands on, from the item selected before it.
+        let offset: Int
+    }
+    private var landedTurn: LandedTurn?
 
     /// Whether a page turn is under way — for tests.
     var isPaging: Bool { paging != nil }
@@ -2954,24 +3049,54 @@ public final class MediaEditorViewController: UIViewController {
     }
 
     /// Lays the track over the canvas with the selected item's neighbours on
-    /// either side. Internal so tests can turn pages without a real touch.
+    /// either side. A turn still animating doesn't hold the drag up: it lands
+    /// on the spot, underneath, and the drag picks its pages up from where
+    /// they are on screen. Internal so tests can turn pages without a touch.
     func beginPaging() {
-        guard paging == nil else { return }
+        var carried: (views: [Int: UIView], shift: Int)?
+        var base: CGFloat = 0
+        // A turn caught springing back to a playing video still owes it its
+        // playback, should this one spring back too.
+        var resumesPlayback = false
+        if let paging {
+            guard !paging.isTracking else { return }
+            let offset = paging.landing ?? 0
+            base = presentedX(of: paging.track) + CGFloat(offset) * paging.pageWidth
+            carried = (paging.pageViews, offset)
+            resumesPlayback = offset == 0 && paging.resumesPlayback
+            paging.track.layer.removeAllAnimations()
+            paging.cover.removeFromSuperview()
+            self.paging = nil
+            if offset != 0, let id = paging.pages[offset] { select(id) }
+        } else if let landed = landedTurn {
+            base = presentedX(of: landed.track) + CGFloat(landed.offset) * landed.pageWidth
+            carried = (landed.pageViews, landed.offset)
+            dismissLandedTurn()
+        }
         let index = selectedIndex
         var pages: [Int: UUID] = [:]
         for offset in [-1, 1] where items.indices.contains(index + offset) {
             pages[offset] = items[index + offset].id
         }
-        startPaging(pages: pages, tracking: true)
+        let started = startPaging(pages: pages, tracking: true, carrying: carried, base: base,
+                                  resumesPlayback: resumesPlayback)
+        // A caught turn is off the screen already; if no new one could take
+        // over, the controls it put away come back.
+        if !started, carried != nil { setVideoControlsFaded(false) }
+    }
+
+    /// Where `track` is on screen, mid-animation included.
+    private func presentedX(of track: UIView) -> CGFloat {
+        track.layer.presentation()?.affineTransform().tx ?? track.transform.tx
     }
 
     /// Moves the track with the finger; past the first or last item it gives
     /// way only grudgingly.
     func updatePaging(translation: CGFloat) {
         guard let paging, paging.isTracking else { return }
-        let offset = translation < 0 ? 1 : -1
-        let x = paging.pages[offset] == nil ? translation * 0.3 : translation
-        paging.track.transform = CGAffineTransform(translationX: x, y: 0)
+        let x = paging.base + translation
+        let offset = x < 0 ? 1 : -1
+        paging.track.transform = CGAffineTransform(translationX: paging.pages[offset] == nil ? x * 0.3 : x, y: 0)
     }
 
     /// Settles the turn: on the neighbour when the drag — carried on by its
@@ -3002,17 +3127,32 @@ public final class MediaEditorViewController: UIViewController {
         // already happened underneath.
         self.paging = nil
         select(id)
+        // Only the target is handed on: it may not be the old item's
+        // neighbour, so nothing else on this track is in place for a drag.
+        let landed = LandedTurn(cover: paging.cover, track: paging.track,
+                                pageViews: paging.pageViews.filter { $0.key == offset },
+                                pageWidth: paging.pageWidth, offset: offset)
+        landedTurn = landed
         UIView.animate(withDuration: 0.35, delay: 0, usingSpringWithDamping: 1,
                        initialSpringVelocity: 0, options: [.allowUserInteraction]) {
             paging.track.transform = CGAffineTransform(translationX: -CGFloat(offset) * paging.pageWidth, y: 0)
         } completion: { [weak self] _ in
-            self?.retire(paging.cover)
+            // Cut short by a drag that took the pages over, there's nothing
+            // left to retire; cut short by anything else, there still is.
+            guard let self, landedTurn?.cover === landed.cover else { return }
+            retire(landed)
         }
     }
 
+    /// Covers the canvas with a track of pages for `pages` around a still of
+    /// the selected item — or, from a turn a drag caught, with that turn's
+    /// own page views, `shift` pages along — starting `base` points aside.
     @discardableResult
-    private func startPaging(pages: [Int: UUID], tracking: Bool) -> Bool {
+    private func startPaging(pages: [Int: UUID], tracking: Bool,
+                             carrying carried: (views: [Int: UIView], shift: Int)? = nil,
+                             base: CGFloat = 0, resumesPlayback: Bool = false) -> Bool {
         guard paging == nil, mode == .normal, items.count > 1, !imageView.bounds.isEmpty else { return false }
+        if landedTurn != nil { dismissLandedTurn() }
         resetZoom()
         overlayContainer.deselect()
         let wasPlaying = isVideoPlaying
@@ -3030,21 +3170,39 @@ public final class MediaEditorViewController: UIViewController {
         let track = UIView(frame: cover.bounds)
         cover.addSubview(track)
         let pageWidth = view.bounds.width
-        let canvas = [imageView, passthroughHost, overlayContainer].filter { !$0.isHidden }
-        for live in canvas {
-            guard let still = live.snapshotView(afterScreenUpdates: false) else { continue }
-            still.frame = live.frame
-            track.addSubview(still)
+
+        func carriedView(at slot: Int) -> UIView? {
+            guard let carried, let page = carried.views[slot + carried.shift] else { return nil }
+            page.frame = page.frame.offsetBy(dx: -CGFloat(carried.shift) * pageWidth, dy: 0)
+            return page
+        }
+        var pageViews: [Int: UIView] = [:]
+        if let current = carriedView(at: 0) {
+            pageViews[0] = current
+        } else {
+            let current = UIView(frame: track.bounds)
+            for live in [imageView, passthroughHost, overlayContainer] where !live.isHidden {
+                guard let still = live.snapshotView(afterScreenUpdates: false) else { continue }
+                still.frame = live.frame
+                current.addSubview(still)
+            }
+            pageViews[0] = current
         }
         for (offset, id) in pages {
+            if let page = carriedView(at: offset) {
+                pageViews[offset] = page
+                continue
+            }
             let page = pageView(for: id)
             page.frame = pageFrame(for: id).offsetBy(dx: CGFloat(offset) * pageWidth, dy: 0)
-            track.addSubview(page)
+            pageViews[offset] = page
         }
+        for page in pageViews.values { track.addSubview(page) }
+        track.transform = CGAffineTransform(translationX: base, y: 0)
         view.insertSubview(cover, aboveSubview: overlayContainer)
         setVideoControlsFaded(true)
-        paging = Paging(cover: cover, track: track, pages: pages, pageWidth: pageWidth, resumesPlayback: wasPlaying,
-                        isTracking: tracking)
+        paging = Paging(cover: cover, track: track, pages: pages, pageViews: pageViews, pageWidth: pageWidth,
+                        base: base, resumesPlayback: wasPlaying || resumesPlayback, isTracking: tracking)
         return true
     }
 
@@ -3052,6 +3210,7 @@ public final class MediaEditorViewController: UIViewController {
     /// springs back — and selects that page's item once it lands.
     private func settlePaging(on offset: Int, velocity: CGFloat) {
         self.paging?.isTracking = false
+        self.paging?.landing = offset
         guard let paging else { return }
         let target = -CGFloat(offset) * paging.pageWidth
         let distance = target - paging.track.transform.tx
@@ -3071,24 +3230,38 @@ public final class MediaEditorViewController: UIViewController {
             }
             self.paging = nil
             self.select(id)
-            self.retire(paging.cover)
+            let landed = LandedTurn(cover: paging.cover, track: paging.track, pageViews: paging.pageViews,
+                                    pageWidth: paging.pageWidth, offset: offset)
+            self.landedTurn = landed
+            self.retire(landed)
         }
     }
 
     /// Fades a landed turn off the canvas it now matches. It keeps covering
     /// the new item for a moment while it loads — a video's first frame takes
     /// one.
-    private func retire(_ cover: UIView) {
+    private func retire(_ landed: LandedTurn) {
         setVideoControlsFaded(false)
         UIView.animate(withDuration: 0.2, delay: 0.05, options: [.allowUserInteraction]) {
-            cover.alpha = 0
-        } completion: { _ in
-            cover.removeFromSuperview()
+            landed.cover.alpha = 0
+        } completion: { [weak self] _ in
+            guard let self, landedTurn?.cover === landed.cover else { return }
+            dismissLandedTurn()
         }
+    }
+
+    /// Takes a landed turn off the screen at once.
+    private func dismissLandedTurn() {
+        guard let landed = landedTurn else { return }
+        landedTurn = nil
+        landed.track.layer.removeAllAnimations()
+        landed.cover.layer.removeAllAnimations()
+        landed.cover.removeFromSuperview()
     }
 
     /// Drops a page turn on the spot, leaving the canvas as it is.
     private func abandonPaging() {
+        dismissLandedTurn()
         guard let paging else { return }
         self.paging = nil
         paging.track.layer.removeAllAnimations()
@@ -3193,6 +3366,8 @@ public final class MediaEditorViewController: UIViewController {
         thumbnailDebounce?.cancel()
         pagePreviewTask?.cancel()
         pagePreviewTask = nil
+        zoomRenderTask?.cancel()
+        zoomRenderTask = nil
         abandonPaging()
         photoLoadTask?.cancel()
         videoLoadTask?.cancel()
