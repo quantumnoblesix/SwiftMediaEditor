@@ -13,6 +13,7 @@
 #if canImport(UIKit)
 
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 import AVFoundation
 import Testing
 import SwiftUI
@@ -36,6 +37,17 @@ private func photoFile(_ image: UIImage) throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent("MediaEditor-\(UUID().uuidString).png")
     try #require(image.pngData()).write(to: url)
     return url
+}
+
+/// A pinch whose state, centroid and touches a test sets.
+private final class ScriptedPinch: UIPinchGestureRecognizer {
+    var scriptedState: UIGestureRecognizer.State = .began
+    override var state: UIGestureRecognizer.State {
+        get { scriptedState }
+        set { scriptedState = newValue }
+    }
+    override func location(in view: UIView?) -> CGPoint { CGPoint(x: 200, y: 400) }
+    override var numberOfTouches: Int { 2 }
 }
 
 @MainActor
@@ -241,6 +253,48 @@ struct SessionTests {
         #expect(editor.selectedItemID == a.id)
     }
 
+    @Test("A drag catches a turn still animating, from where its pages are, and can turn straight back")
+    func pagingCanBeInterrupted() async throws {
+        let a = MediaEditorItem(source: .photo(photo(.red)))
+        let b = MediaEditorItem(source: .photo(photo(.green)))
+        let c = MediaEditorItem(source: .photo(photo(.blue)))
+        let editor = session([a, b, c])
+        let width = editor.view.bounds.width
+
+        // A flick to b, caught at once while it's still sliding home.
+        editor.beginPaging()
+        editor.updatePaging(translation: -width * 0.3)
+        editor.endPaging(velocity: -1500)
+        // Usually still settling by now; on a loaded machine it may have just
+        // landed and be fading out. A drag takes over either way.
+        try await Task.sleep(for: .milliseconds(60))
+        editor.beginPaging()
+        #expect(editor.selectedItemID == b.id, "the caught turn lands at once")
+        #expect(editor.isPaging, "and the new drag starts straight away")
+        let cover = try #require(editor.view.subviews.first { $0.frame == editor.view.bounds && !$0.isUserInteractionEnabled })
+        let track = try #require(cover.subviews.first)
+        // Where the animation had got to on screen — which an off-screen test
+        // window may report as already home, hence `>=`.
+        #expect(track.transform.tx >= 0 && track.transform.tx < width / 2,
+                "no jump: b stays where it was on screen")
+        #expect(editor.view.subviews.filter { $0.frame == editor.view.bounds && !$0.isUserInteractionEnabled }.count == 1,
+                "one cover, not one per turn")
+
+        // …and straight back to a.
+        editor.updatePaging(translation: width * 0.7)
+        editor.endPaging(velocity: 0)
+        try await waitUntil { !editor.isPaging }
+        #expect(editor.selectedItemID == a.id)
+
+        // Right after landing, while the turn fades out, a drag starts at once too.
+        editor.beginPaging()
+        #expect(editor.isPaging)
+        #expect(abs(try #require(editor.view.subviews.first { $0.frame == editor.view.bounds && !$0.isUserInteractionEnabled })
+            .subviews.first!.transform.tx) < 1)
+        editor.endPaging(velocity: 0, cancelled: true)
+        try await waitUntil { !editor.isPaging }
+    }
+
     @Test("A page turn lays its track below the chrome and clears it after")
     func pagingTrack() async throws {
         let a = MediaEditorItem(source: .photo(photo()))
@@ -325,7 +379,7 @@ struct SessionTests {
     }
 
     @Test("A double tap zooms the media and its edits together, and a second one zooms back out")
-    func doubleTapZooms() throws {
+    func doubleTapZooms() async throws {
         let editor = session([MediaEditorItem(source: .photo(photo(size: CGSize(width: 4000, height: 3000)))),
                               MediaEditorItem(source: .photo(photo()))])
         let (image, overlay) = try canvas(of: editor)
@@ -335,13 +389,57 @@ struct SessionTests {
         #expect(editor.isZoomed)
         #expect(image.transform.a == 2.5)
         #expect(overlay.transform == image.transform, "stickers and drawing zoom with the media")
-        #expect(try #require(image.image).size.width > unzoomedPixels * 2, "re-rendered sharper for the zoom")
+        try await waitUntil { (image.image?.size.width ?? 0) > unzoomedPixels * 2 }   // sharpened in the background
         #expect(!overlay.canvasPan.pagesItems, "a drag pans the zoomed media instead of paging")
 
         editor.handleCanvasDoubleTap(at: .zero)
         #expect(!editor.isZoomed)
         #expect(image.transform == .identity)
         #expect(overlay.canvasPan.pagesItems)
+        #expect(try #require(image.image).size.width == unzoomedPixels, "the unzoomed preview is back at once")
+    }
+
+    @Test("A pinch only moves the picture; it's re-rendered once, off the main actor, after")
+    func pinchDoesNotRender() async throws {
+        let editor = session([MediaEditorItem(source: .photo(photo(size: CGSize(width: 4000, height: 3000))))])
+        let (image, overlay) = try canvas(of: editor)
+        let unzoomed = try #require(image.image)
+        let pinch = ScriptedPinch(target: nil, action: nil)
+        overlay.onCanvasPinch?(pinch)
+        pinch.scriptedState = .changed
+        for _ in 0..<30 {
+            pinch.scale = 1.05
+            overlay.onCanvasPinch?(pinch)
+            editor.view.layoutIfNeeded()       // a pinch lays the views out every frame
+            #expect(image.image === unzoomed, "no re-render mid-pinch")
+        }
+        pinch.scriptedState = .ended
+        overlay.onCanvasPinch?(pinch)
+        #expect(image.image === unzoomed, "the sharper render doesn't block the main actor")
+        try await waitUntil { image.image !== unzoomed }
+    }
+
+    @Test("Zoomed in, an edit shows at once at screen size, then sharpens; no zoomed-size source is kept")
+    func editWhileZoomed() async throws {
+        let editor = session([MediaEditorItem(source: .photo(photo(size: CGSize(width: 4000, height: 3000))))])
+        let (image, overlay) = try canvas(of: editor)
+        let screenSized = try #require(image.image).size.width
+        let source = try #require(editor.previewSourcePixelSize)
+
+        editor.handleCanvasDoubleTap(at: CGPoint(x: overlay.bounds.midX, y: overlay.bounds.midY))
+        try await waitUntil { (image.image?.size.width ?? 0) > screenSized * 2 }
+        #expect(editor.previewSourcePixelSize == source, "only the rendered picture is zoomed-size")
+
+        var next = editor.recipe
+        next.filter = .mono
+        editor.apply(next)
+        #expect(try #require(image.image).size.width == screenSized, "rendered at screen size, not at the zoom")
+        #expect(editor.isZoomed, "the zoom stays")
+        try await waitUntil { (image.image?.size.width ?? 0) > screenSized * 2 }   // and sharpens again
+
+        editor.handleCanvasDoubleTap(at: .zero)
+        #expect(try #require(image.image).size.width == screenSized, "zoomed out at once, with the edit")
+        #expect(editor.previewSourcePixelSize == source)
     }
 
     @Test("Zoomed media can't be moved past its own edges")
